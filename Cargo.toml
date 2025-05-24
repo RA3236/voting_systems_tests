@@ -1,0 +1,27 @@
+[package]
+name = "voting_systems_tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+color-eyre = "0.6.4"
+eframe = { version = "0.31.1", git = "https://github.com/emilk/egui.git" }
+egui = { version = "0.31.1", features = ["rayon"], git = "https://github.com/emilk/egui.git" }
+egui-file-dialog = "0.10.0"
+egui_extras = { version = "0.31.1", features = ["all_loaders", "svg_text"], git = "https://github.com/emilk/egui.git" }
+kiddo = { version = "5.0.3", features = ["simd"] }
+rand = "0.9.1"
+rand_distr = "0.5.1"
+rayon = "1.10.0"
+rustc-hash = "2.1.1"
+
+methods = { path = "./methods" }
+charming = { version = "0.5.0", features = ["ssr"] }
+serde = "1.0.219"
+serde_json = "1.0.140"
+
+[profile.release]
+debug = true
+
+[workspace]
+members = ["methods"]
