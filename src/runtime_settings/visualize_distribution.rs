@@ -133,8 +133,16 @@ impl VisualizeDistribution {
 
             // Plot the distributions
             for (name, results) in method_data {
-                let (save_file, uri) = super::get_file_and_uri(super::SAVE_VISUALIZE, &format!("{name}.svg"));
-                super::common::density::<SquaredEuclidean, _>(results, &sender, &name, &save_file, &uri, "Visualizations");
+                let (save_file, uri) =
+                    super::get_file_and_uri(super::SAVE_VISUALIZE, &format!("{name}.svg"));
+                super::common::plot_density::<SquaredEuclidean, _>(
+                    results,
+                    &sender,
+                    &name,
+                    &save_file,
+                    &uri,
+                    "Visualizations",
+                );
                 CONTEXT.get().inspect(|c| c.request_repaint());
             }
             sender.send(Message::SimulationFinished).unwrap();

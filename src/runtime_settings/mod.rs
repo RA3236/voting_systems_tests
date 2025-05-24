@@ -141,6 +141,17 @@ impl AppRuntimeSettings {
                     self.progress.clear();
                     self.totals.clear();
 
+                    std::fs::remove_dir_all("output").unwrap();
+                    for location in [
+                        SAVE_VISUALIZE,
+                        SAVE_WINNER_TYPE,
+                        SAVE_DISTANCES,
+                        SAVE_SEATS_PROJECTION,
+                    ] {
+                        let dir_name = format!("{SAVE_LOCATION}/{location}");
+                        std::fs::create_dir_all(dir_name).unwrap();
+                    }
+
                     for (i, action) in self.actions.iter().enumerate() {
                         self.progress
                             .push((action.to_str(), Arc::new(AtomicUsize::new(0))));

@@ -161,7 +161,8 @@ impl WinnerTypeSettings {
 
             renderer.save(&chart, save_path).unwrap();
             sender
-                .send(Message::ImageFilePath(
+                .send(Message::ImageStandard(
+                    ArcIntern::from("Winner Types"),
                     ArcIntern::from("Winner Types"),
                     uri.into(),
                 ))

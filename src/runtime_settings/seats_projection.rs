@@ -1,9 +1,19 @@
 use std::{
-    process::exit, sync::{atomic::AtomicUsize, Arc}, time::{Duration, Instant}, usize
+    process::exit,
+    sync::{Arc, atomic::AtomicUsize},
+    time::{Duration, Instant},
+    usize,
 };
 
 use charming::{
-    component::{Axis, Grid, Legend, Title}, datatype::{DataPoint, DataPointItem}, element::{AxisType, ItemStyle, Label, LineStyle, MarkLine, MarkLineData, MarkLineVariant, Symbol}, series::{Bar, Scatter}, Chart, ImageRenderer
+    Chart, ImageRenderer,
+    component::{Axis, Grid, Legend, Title, VisualMap},
+    datatype::{DataPoint, DataPointItem},
+    element::{
+        AxisType, Color, ItemStyle, Label, LineStyle, MarkLine, MarkLineData, MarkLineVariant,
+        Symbol,
+    },
+    series::{Bar, Scatter},
 };
 use egui::{Align, Color32, FontSelection, Layout, RichText, UiBuilder, text::LayoutJob};
 use indicatif::{ParallelProgressIterator, ProgressStyle};
@@ -41,7 +51,7 @@ impl Default for SeatsProjectionSettings {
             num_seats: 151,
             num_iterations: 1000,
             watch_method: Method::default(),
-            max_offset: 0.75,
+            max_offset: 0.25,
             save_winner_types_to_file: true,
         }
     }
@@ -433,29 +443,50 @@ impl SeatsProjectionSettings {
 
             // Plot number of times the result was different to proportional
             let chart = Chart::new()
-                .y_axis(Axis::new().type_(AxisType::Category).data(method_names[0..len_wo_prop].to_vec()))
+                .y_axis(
+                    Axis::new()
+                        .type_(AxisType::Category)
+                        .data(method_names[0..len_wo_prop].to_vec()),
+                )
                 .x_axis(Axis::new().type_(AxisType::Value))
                 .grid(Grid::new().left("center").top("middle"))
-                .series(
-                    Bar::new()
-                        .data(iteration_results)
+                .series(Bar::new().data(iteration_results))
+                .title(
+                    Title::new()
+                        .text("# Different Governments from Proportional")
+                        .left("center"),
                 )
-                .title(Title::new().text("# Different Governments from Proportional").left("center"))
                 .background_color("#ffffff");
-            let (save_path, uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "differences.svg");
+            let (save_path, uri) =
+                super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "differences.svg");
             renderer.save(&chart, save_path).unwrap();
-            sender.send(Message::ImageFilePath(ArcIntern::from("Seat Projections"), ArcIntern::from(uri))).unwrap();
+            sender
+                .send(Message::ImageSeatProjectionSingle(
+                    ArcIntern::from("Seat Projections"),
+                    ArcIntern::from("Number of differences"),
+                    ArcIntern::from(uri),
+                ))
+                .unwrap();
 
             // Plot both the voters and candidates, so we know where they are
             let (vx, vy) = (&main_data.vx, &main_data.vy);
-            let (cx, cy) = (&main_data.cx, &main_data.cy);
-            let (voters_save_file, voters_uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "voters.svg");
-            let (parties_save_file, parties_uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "parties.svg");
-            super::common::density::<SquaredEuclidean, _>((vx.as_ref(), vy.as_ref()), &sender, "Voters", &voters_save_file, &voters_uri, "Seat Projections (Data)");
-            super::common::density::<SquaredEuclidean, _>((cx.as_ref(), cy.as_ref()), &sender, "Parties", &parties_save_file, &parties_uri, "Seat Projections (Data)");
+            // let (cx, cy) = (&main_data.cx, &main_data.cy);
+            // let (voters_save_file, voters_uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "voters.svg");
+            // let (parties_save_file, parties_uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "parties.svg");
+            // super::common::plot_density::<SquaredEuclidean, _>((vx.as_ref(), vy.as_ref()), &sender, "Voters", &voters_save_file, &voters_uri, "Seat Projections (Data)");
+            // super::common::plot_density::<SquaredEuclidean, _>((cx.as_ref(), cy.as_ref()), &sender, "Parties", &parties_save_file, &parties_uri, "Seat Projections (Data)");
 
-            for (iter, method_party_diff, main_results_data, party_positions) in results_receiver.try_iter().take(5) {
+            let colors = [
+                "#FF3030", "#FF9900", "#FFFF33", "#33CC33", "#00CCCC", "#3399FF", "#9933FF",
+                "#FF33CC", "#00FFCC", "#3366FF",
+            ]
+            .into_iter()
+            .map(|c| Color::from(c))
+            .collect::<Vec<_>>();
 
+            for (iter, method_party_diff, main_results_data, party_positions) in
+                results_receiver.try_iter().take(5)
+            {
                 // Convert main_results_data into datapoint vec
                 let main_results_data: Vec<Vec<DataPoint>> = main_results_data
                     .into_iter()
@@ -464,35 +495,31 @@ impl SeatsProjectionSettings {
                         let datapoint: Vec<DataPoint> = data
                             .into_iter()
                             .enumerate()
-                            .map(|(method, method_data)| {
-                                match method_party_diff.contains(&party) {
-                                    true => {
-                                        DataPointItem::new(method_data)
-                                            .item_style(
-                                                ItemStyle::new()
-                                                    .border_color(
-                                                        if method == watch_method_index {
-                                                            "#FF0000"
-                                                        } else {
-                                                            "#000000"
-                                                        }
-                                                    )
-                                                    .border_width(1.0)
-                                            ).into()
-                                    },
-                                    false => {
-                                        DataPointItem::new(method_data).into()
-                                    }
-                                }
-                            })
+                            .map(
+                                |(method, method_data)| match method_party_diff.contains(&party) {
+                                    true => DataPointItem::new(method_data)
+                                        .item_style(
+                                            ItemStyle::new()
+                                                .border_color(if method == watch_method_index {
+                                                    "#FF0000"
+                                                } else {
+                                                    "#000000"
+                                                })
+                                                .border_width(1.0),
+                                        )
+                                        .into(),
+                                    false => DataPointItem::new(method_data).into(),
+                                },
+                            )
                             .collect::<Vec<DataPoint>>();
                         datapoint
                     })
                     .collect();
-                
+
                 // Plot seat projections
                 let mut chart = Chart::new()
                     .legend(Legend::new().top("bottom").left("center").show(true))
+                    .color(colors.clone())
                     .x_axis(Axis::new().type_(AxisType::Value))
                     .y_axis(
                         Axis::new()
@@ -536,39 +563,51 @@ impl SeatsProjectionSettings {
                 );
                 renderer.save(&chart, &save_file).unwrap();
                 sender
-                    .send(Message::ImageFilePath(
-                        ArcIntern::from(format!("({iter}) Seat Projections")),
+                    .send(Message::ImageSeatProjectionMultiple(
+                        ArcIntern::from("Seat Projections"),
+                        ArcIntern::from("Individual Results"),
+                        ArcIntern::from(format!("Seat Counts ({iter})")),
                         ArcIntern::from(uri),
                     ))
                     .unwrap();
 
                 // Visualise candidate positions
-                let mut chart = Chart::new()
-                    .legend(Legend::new().top("bottom").left("center").show(true))
-                    .title(
-                        Title::new()
-                            .text(format!("Seat Projections ({iter})"))
-                            .left("center"),
-                    )
-                    .x_axis(Axis::new().min(0.0).max(1.0))
-                    .y_axis(Axis::new().min(0.0).max(1.0))
-                    .background_color("#ffffff");
+                let mut chart = super::common::create_density_chart::<SquaredEuclidean, _>(
+                    (vx.as_ref(), vy.as_ref()),
+                    &format!("Party Positions ({iter})"),
+                    false,
+                )
+                .color(colors.clone())
+                .legend(Legend::new().top("bottom").left("center").show(true))
+                .x_axis(Axis::new().min(0.0).max(1.0))
+                .y_axis(Axis::new().min(0.0).max(1.0));
                 for i in 0..num_parties {
                     let name = party_names[i].clone();
                     let position = vec![party_positions[i].clone()];
                     chart = chart.series(
-                        Scatter::new().name(name).data(position).mark_line(
-                            MarkLine::new()
-                                .data(vec![MarkLineVariant::Simple(
-                                    MarkLineData::new().name("Midpoint").x_axis(0.5),
-                                ), MarkLineVariant::Simple(
-                                    MarkLineData::new().name("Midpoint").y_axis(0.5),
-                                )])
-                                .line_style(LineStyle::new().color("black"))
-                                .symbol(vec![Symbol::Circle, Symbol::Circle]),
-                        ),
+                        Scatter::new()
+                            .name(name)
+                            .data(position)
+                            .x_axis_index(1)
+                            .y_axis_index(1)
+                            .item_style(ItemStyle::new().border_width(2.0))
+                            .mark_line(
+                                MarkLine::new()
+                                    .data(vec![
+                                        MarkLineVariant::Simple(
+                                            MarkLineData::new().name("Midpoint").x_axis(0.5),
+                                        ),
+                                        MarkLineVariant::Simple(
+                                            MarkLineData::new().name("Midpoint").y_axis(0.5),
+                                        ),
+                                    ])
+                                    .line_style(LineStyle::new().color("black"))
+                                    .symbol(vec![Symbol::Circle, Symbol::Circle]),
+                            ),
                     )
                 }
+
+                std::fs::write("test.json", chart.to_string().as_bytes()).unwrap();
 
                 let (save_file, uri) = super::get_file_and_uri(
                     super::SAVE_SEATS_PROJECTION,
@@ -577,8 +616,10 @@ impl SeatsProjectionSettings {
 
                 renderer.save(&chart, &save_file).unwrap();
                 sender
-                    .send(Message::ImageFilePath(
-                        ArcIntern::from(format!("({iter}) Seat Projections")),
+                    .send(Message::ImageSeatProjectionMultiple(
+                        ArcIntern::from("Seat Projections"),
+                        ArcIntern::from("Individual Results"),
+                        ArcIntern::from(format!("Party Positions ({iter})")),
                         ArcIntern::from(uri),
                     ))
                     .unwrap();
@@ -652,9 +693,7 @@ impl SeatsProjectionMainData {
                 } else {
                     (1.0 - 2.0 * (1.0 - b), 1.0)
                 };
-                vx1.iter().copied().map(move |x| {
-                    a + ((c - a) * x)
-                })
+                vx1.iter().copied().map(move |x| a + ((c - a) * x))
             })
             .collect::<Vec<_>>();
 

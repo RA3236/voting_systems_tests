@@ -159,8 +159,9 @@ impl DistanceSettings {
 
             renderer.save(&chart, save_file).unwrap();
             sender
-                .send(Message::ImageFilePath(
+                .send(Message::ImageStandard(
                     ArcIntern::from("Distances"),
+                    ArcIntern::from("Average Distances"),
                     uri.into(),
                 ))
                 .unwrap();

@@ -1,8 +1,15 @@
 use std::sync::LazyLock;
 
-use charming::{component::{Axis, Title, VisualMap, VisualMapChannel}, datatype::DataPoint, df, element::{AxisType, Orient}, series::Heatmap, Chart, ImageRenderer};
+use charming::{
+    Chart, ImageRenderer,
+    component::{Axis, Title, VisualMap, VisualMapChannel},
+    datatype::DataPoint,
+    df,
+    element::{AxisType, Orient},
+    series::Heatmap,
+};
 use internment::ArcIntern;
-use kiddo::{traits::DistanceMetric, KdTree};
+use kiddo::{KdTree, traits::DistanceMetric};
 use methods::{PopulaceMethod, VectorMethod};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -20,42 +27,62 @@ pub fn linspace(start: f64, end: f64, steps: usize, endpoint: bool) -> Vec<f64> 
 }
 
 /// Bar chart with multiple series
-/// 
+///
 /// This assumes that all stacked bars will sum up nicely to the same value.
 
 /// Visualize a set of points
-pub fn density<D: DistanceMetric<f64, 2>, V: IntoDistanceCount<D>>(
+pub fn plot_density<D: DistanceMetric<f64, 2>, V: IntoDistanceCount<D>>(
     values: V,
     sender: &std::sync::mpsc::Sender<crate::Message>,
     title: &str,
     save_file: &str,
     uri: &str,
-    category: &str
+    category: &str,
 ) {
+    let chart = create_density_chart(values, title, true);
+
+    let mut renderer = ImageRenderer::new(400, 400);
+    renderer.save(&chart, save_file).unwrap();
+
+    sender
+        .send(Message::ImageStandard(
+            ArcIntern::from(category),
+            ArcIntern::from(title),
+            ArcIntern::from(uri),
+        ))
+        .unwrap();
+}
+
+pub fn create_density_chart<D: DistanceMetric<f64, 2>, V: IntoDistanceCount<D>>(
+    values: V,
+    title: &str,
+    visual_map: bool,
+) -> Chart {
     let (max, z) = values.into_kdtree(&DENSITY_X, &DENSITY_Y);
 
-    let chart = Chart::new()
+    let mut chart = Chart::new()
+        .title(Title::new().left("center").text(title))
+        .background_color("#ffffff")
+        .series(
+            Heatmap::new()
+                .data(z)
+                //.name(title)
+                .x_axis_index(0)
+                .y_axis_index(0),
+        )
         .x_axis(
             Axis::new()
                 .type_(AxisType::Category)
-                .data(
-                    DENSITY_X_LABELS.to_vec()
-                )
+                .data(DENSITY_X_LABELS.to_vec()),
         )
         .y_axis(
             Axis::new()
                 .type_(AxisType::Category)
-                .data(
-                    DENSITY_Y_LABELS.to_vec()
-                )
-        )
-        .title(
-            Title::new()
-                .left("center")
-                .text(title)
-        )
-        .background_color("#ffffff")
-        .visual_map(
+                .data(DENSITY_Y_LABELS.to_vec()),
+        );
+
+    if visual_map {
+        chart = chart.visual_map(
             VisualMap::new()
                 .min(0.0)
                 .max(max as f64)
@@ -63,20 +90,33 @@ pub fn density<D: DistanceMetric<f64, 2>, V: IntoDistanceCount<D>>(
                 .orient(Orient::Horizontal)
                 .left("center")
                 .in_range(VisualMapChannel::new().color(vec![
-                    "#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8", "#ffffbf",
-                    "#fee090", "#fdae61", "#f46d43", "#d73027", "#a50026",
+                    "#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8", "#ffffbf", "#fee090",
+                    "#fdae61", "#f46d43", "#d73027", "#a50026",
                 ])),
         )
-        .series(
-            Heatmap::new()
-                .data(z)
-                .name(title)
-        );
-    
-    let mut renderer = ImageRenderer::new(400, 400);
-    renderer.save(&chart, save_file).unwrap();
-
-    sender.send(Message::ImageFilePath(ArcIntern::from(category), ArcIntern::from(uri))).unwrap();
+    } else {
+        chart = chart.visual_map(
+            VisualMap::new()
+                .min(0.0)
+                .max(max as f64)
+                .show(false)
+                .series_index(0)
+                .in_range(VisualMapChannel::new().color(vec![
+                    "#31369544",
+                    "#4575b444",
+                    "#74add144",
+                    "#abd9e944",
+                    "#e0f3f844",
+                    "#ffffbf44",
+                    "#fee09044",
+                    "#fdae6144",
+                    "#f46d4344",
+                    "#d7302744",
+                    "#a5002644",
+                ])),
+        )
+    }
+    chart
 }
 
 pub trait IntoDistanceCount<D: DistanceMetric<f64, 2>> {
@@ -94,17 +134,12 @@ pub trait IntoDistanceCount<D: DistanceMetric<f64, 2>> {
             .copied()
             .zip(DENSITY_X_LABELS.iter())
             .flat_map(|(x, xname)| {
-                y
-                    .into_iter()
+                y.into_iter()
                     .copied()
                     .zip(DENSITY_Y_LABELS.iter())
                     .map(|(y, yname)| {
-                        let count = kdtree
-                            .within_unsorted_iter::<D>(
-                                &[x, y],
-                                radius
-                            )
-                            .count() as i64;
+                        let count =
+                            kdtree.within_unsorted_iter::<D>(&[x, y], radius).count() as i64;
                         max = max.max(count);
                         df![xname.clone(), yname.clone(), count]
                     })
@@ -124,7 +159,8 @@ impl<D: DistanceMetric<f64, 2>> IntoDistanceCount<D> for Vec<[f64; 2]> {
 
 impl<'a, D: DistanceMetric<f64, 2>> IntoDistanceCount<D> for (&'a [f64], &'a [f64]) {
     fn into_kdtree(self, x: &[f64], y: &[f64]) -> (i64, Vec<Vec<DataPoint>>) {
-        let kdtree = self.0
+        let kdtree = self
+            .0
             .into_iter()
             .copied()
             .zip(self.1.into_iter().copied())
