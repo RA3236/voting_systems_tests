@@ -1,4 +1,7 @@
-use std::simd::{Simd, num::SimdFloat};
+use std::{
+    simd::{Simd, num::SimdFloat},
+    sync::{Arc, atomic::AtomicUsize},
+};
 
 use charming::{
     Chart, ImageRenderer,
@@ -6,16 +9,14 @@ use charming::{
     element::AxisType,
     series::Bar,
 };
+use internment::ArcIntern;
 use methods::{Method, MethodFn};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 
-use crate::{
-    Message, Sender,
-    runtime_settings::common::StandardData,
-};
+use crate::{Message, MessageSender, runtime_settings::common::StandardData};
 
-use super::{Distribution, ScoreHandle, visualize_distribution::VisualizeDistribution};
+use super::{DistributionManager, ScoreHandle, visualize_distribution::VisualizeDistribution};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DistanceSettings {
@@ -37,14 +38,20 @@ impl DistanceSettings {
 
     pub fn simulate(
         &mut self,
-        sender: &Sender,
+        sender: &MessageSender,
         methods: &FxHashMap<Method, Vec<ScoreHandle>>,
-        distr: &Distribution,
+        distr: &DistributionManager,
+        progress: Arc<AtomicUsize>,
+        total: Arc<AtomicUsize>,
     ) {
         let sender = sender.clone();
         let settings = self.inner.clone();
         let distr = distr.clone();
         let methods = methods.clone();
+        total.store(
+            settings.num_iterations * methods.len(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         rayon::spawn(move || {
             // Setup voters and candidates
             let num_iters = settings.num_iterations;
@@ -54,6 +61,7 @@ impl DistanceSettings {
                 settings.num_candidates,
                 settings.num_iterations,
             );
+            let progress = progress.clone();
 
             // Get method names and functions
             let (method_names, funcs) = methods
@@ -93,6 +101,7 @@ impl DistanceSettings {
                             let average_winner = Simd::from_array(average_winner);
                             let condorcet_winner = condorcet_winner.map(Simd::from_array);
 
+                            progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             (
                                 ((this_winner - average_winner) * (this_winner - average_winner))
                                     .reduce_sum()
@@ -150,9 +159,12 @@ impl DistanceSettings {
 
             renderer.save(&chart, save_file).unwrap();
             sender
-                .send(Message::ImageFilePath(uri))
+                .send(Message::ImageFilePath(
+                    ArcIntern::from("Distances"),
+                    uri.into(),
+                ))
                 .unwrap();
-            sender.send(Message::Unlock).unwrap();
+            sender.send(Message::SimulationFinished).unwrap();
         });
     }
 }

@@ -86,6 +86,64 @@ pub fn create_populace(
     check!();
 }
 
+pub fn create_populace_mut(
+    vx: &[f64],
+    vy: &[f64],
+    cx: &[f64],
+    cy: &[f64],
+    num_candidates: usize,
+    populace: &mut Vec<Vec<f64>>,
+) {
+    fn inner<const N: usize>(
+        vx: &[f64],
+        vy: &[f64],
+        cx: &[f64],
+        cy: &[f64],
+        populace: &mut Vec<Vec<f64>>,
+    ) where
+        LaneCount<N>: SupportedLaneCount,
+    {
+        vx.into_iter()
+            .copied()
+            .zip(vy.into_iter().copied())
+            .zip(populace.iter_mut())
+            .for_each(|((vx, vy), array)| {
+                let (vx, vy) = (Simd::splat(vx), Simd::splat(vy));
+
+                cx.array_chunks::<N>()
+                    .copied()
+                    .zip(cy.array_chunks().copied())
+                    .enumerate()
+                    .for_each(|(i, (cx, cy))| {
+                        let (cx, cy) = (Simd::from_array(cx), Simd::from_array(cy));
+
+                        ((vx - cx) * (vx - cx) + (vy - cy) * (vy - cy))
+                            .sqrt()
+                            .copy_to_slice(&mut array[i * N..])
+                    });
+            });
+    }
+
+    populace.iter_mut().for_each(|voter| voter.fill(0.0));
+
+    macro_rules! check {
+        ($n:literal, $f:expr) => {
+            #[cfg(target_feature = $f)]
+            if vx.len() % $n == 0 && num_candidates % $n == 0 {
+                inner::<$n>(vx, vy, cx, cy, populace);
+            }
+        };
+        () => {
+            inner::<1>(vx, vy, cx, cy, populace);
+        };
+    }
+
+    check!(8, "avx2");
+    check!(4, "avx");
+    check!(2, "sse2");
+    check!();
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RangeFloatIterator {
     start: f64,

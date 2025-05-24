@@ -1,19 +1,22 @@
+use std::sync::{Arc, atomic::AtomicUsize};
+
 use charming::{
     Chart, ImageRenderer,
     component::{Axis, Grid, Legend, Title},
     element::AxisType,
     series::Bar,
 };
+use internment::ArcIntern;
 use methods::{Method, MethodFn};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Message, Sender,
+    Message, MessageSender,
     runtime_settings::common::{StandardData, WinnerType},
 };
 
-use super::{Distribution, ScoreHandle, visualize_distribution::VisualizeDistribution};
+use super::{DistributionManager, ScoreHandle, visualize_distribution::VisualizeDistribution};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WinnerTypeSettings {
@@ -35,14 +38,20 @@ impl WinnerTypeSettings {
 
     pub fn simulate(
         &mut self,
-        sender: &Sender,
+        sender: &MessageSender,
         methods: &FxHashMap<Method, Vec<ScoreHandle>>,
-        distr: &Distribution,
+        distr: &DistributionManager,
+        progress: Arc<AtomicUsize>,
+        total: Arc<AtomicUsize>,
     ) {
         let sender = sender.clone();
         let settings = self.inner.clone();
         let distr = distr.clone();
         let methods = methods.clone();
+        total.store(
+            settings.num_iterations * methods.len(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         rayon::spawn(move || {
             // Setup voters and candidates
             let num_iters = settings.num_iterations;
@@ -87,6 +96,7 @@ impl WinnerTypeSettings {
                             let average_winner = average[i];
                             let condorcet_winner = methods::condorcet(&populace).unwrap();
 
+                            progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             if let Some(condorcet_winner) = condorcet_winner {
                                 if this_winner == condorcet_winner {
                                     if this_winner == average_winner {
@@ -146,13 +156,17 @@ impl WinnerTypeSettings {
 
             let mut renderer = ImageRenderer::new(800, 500);
 
-            let (save_path, uri) = super::get_file_and_uri(super::SAVE_WINNER_TYPE, "winner types.svg");
+            let (save_path, uri) =
+                super::get_file_and_uri(super::SAVE_WINNER_TYPE, "winner types.svg");
 
             renderer.save(&chart, save_path).unwrap();
             sender
-                .send(Message::ImageFilePath(uri))
+                .send(Message::ImageFilePath(
+                    ArcIntern::from("Winner Types"),
+                    uri.into(),
+                ))
                 .unwrap();
-            sender.send(Message::Unlock).unwrap();
+            sender.send(Message::SimulationFinished).unwrap();
         });
     }
 }

@@ -3,14 +3,18 @@
 #![feature(array_chunks)]
 
 use std::{
+    ops::Deref,
     sync::OnceLock,
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::eyre;
+use charming::{Chart, ImageRenderer};
 use eframe::NativeOptions;
-use egui::{Context, Rect};
+use egui::{Context, Rect, Ui};
+use internment::ArcIntern;
+use rayon::Yield;
 use runtime_settings::AppRuntimeSettings;
+use rustc_hash::FxHashMap;
 
 pub mod runtime_settings;
 pub mod util;
@@ -28,43 +32,46 @@ pub fn main() -> color_eyre::Result<()> {
     eframe::run_native(
         "Voting Methods",
         Default::default(),
-        Box::new(|_cc| Ok(Box::new(EguiApp::default()))),
-    )
-    .map_err(|err| eyre!("{}", err))?;
+        Box::new(|_cc| Ok(Box::new(EguiApp::new()))),
+    ).unwrap();
 
     Ok(())
 }
 
-pub type Sender = std::sync::mpsc::Sender<Message>;
-pub type Receiver = std::sync::mpsc::Receiver<Message>;
+
+pub type MessageSender = std::sync::mpsc::Sender<Message>;
+pub type MessageReceiver = std::sync::mpsc::Receiver<Message>;
 
 pub static CONTEXT: OnceLock<Context> = OnceLock::new();
 
 struct EguiApp {
     runtime_settings: AppRuntimeSettings,
 
-    images: Vec<String>,
-    current_image: usize,
+    images: ImageStore,
 
-    sender: Sender,
-    receiver: Receiver,
+    current_image: usize,
+    current_group: usize,
+
+    sender: MessageSender,
+    receiver: MessageReceiver,
 
     prev_rect: Rect,
     dur: Option<Instant>,
 }
 
-impl Default for EguiApp {
-    fn default() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel();
+impl EguiApp {
+    fn new() -> Self {
+        let (egui_sender, egui_receiver) = std::sync::mpsc::channel();
 
         Self {
             runtime_settings: AppRuntimeSettings::default(),
 
-            images: vec![],
+            images: ImageStore::default(),
             current_image: 0,
+            current_group: 0,
 
-            sender,
-            receiver,
+            sender: egui_sender,
+            receiver: egui_receiver,
 
             prev_rect: Rect::EVERYTHING,
             dur: None,
@@ -73,6 +80,10 @@ impl Default for EguiApp {
 }
 
 impl eframe::App for EguiApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.sender.send(Message::AppShutdown).unwrap();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if CONTEXT.get().is_none() {
             CONTEXT.set(ctx.clone()).unwrap();
@@ -82,16 +93,29 @@ impl eframe::App for EguiApp {
 
         for msg in self.receiver.try_iter() {
             match msg {
-                Message::ImageFilePath(data) => {
-                    self.images.push(data);
+                Message::ImageFilePath(key, value) => {
+                    let ImageStore { images, keys } = &mut self.images;
+
+                    images
+                        .entry(key.clone())
+                        .and_modify(|values| {
+                            values.push(value.clone());
+                        })
+                        .or_insert_with(|| {
+                            keys.push(key);
+                            vec![value.clone()]
+                        });
                 }
                 Message::DropImages => {
-                    self.images.clear();
+                    self.images = ImageStore::default();
+                    self.current_group = 0;
+                    self.current_image = 0;
                     ctx.forget_all_images();
                 }
-                Message::Unlock => {
+                Message::SimulationFinished => {
                     self.runtime_settings.unlock();
-                }
+                },
+                _ => {} // We don't care about anything else
             }
         }
 
@@ -126,59 +150,123 @@ impl eframe::App for EguiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            let ImageStore { images, keys } = &self.images;
             if self.runtime_settings.locked() {
-                ui.centered_and_justified(|ui| {
-                    ui.spinner();
+                ui.vertical(|ui| {
+                    for (name, progress) in self.runtime_settings.progress() {
+                        ui.heading(name);
+                        ui.add(
+                            egui::ProgressBar::new(progress as f32)
+                                .show_percentage()
+                                .animate(true),
+                        );
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Images may take a second to load...");
+                        });
+                    }
                 });
-            } else if self.images.is_empty() {
+                return;
+            }
+            if keys.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Start a simulation to begin.");
+                    ui.label("Waiting for images...");
                 });
+            } else if keys.len() == 1 {
+                let images = &images[&keys[0]];
+                two_wide_buttons(
+                    ui,
+                    "Previous Image",
+                    "Next Image",
+                    images.len(),
+                    &mut self.current_image,
+                );
+
+                let image = &images[self.current_image];
+                ui.add(egui::Image::new(image.deref()).shrink_to_fit());
             } else {
-                if self.images.len() == 1 {
-                    self.current_image = 0;
-                }
-                ui.add_enabled_ui(self.images.len() > 1, |ui| {
-                    ui.vertical_centered_justified(|ui| {
-                        let available_space = ui.available_width();
-                        let spacing = ui.style().spacing.item_spacing.x;
-                        let button_width = (available_space - spacing) / 2.0;
+                ui.vertical_centered_justified(|ui| {
+                    let available_space = ui.available_width();
+                    let spacing = ui.style().spacing.item_spacing.x;
+                    let widget_width = (available_space - spacing) / 2.0;
 
-                        egui::Grid::new("image_buttons_grid")
-                            .min_col_width(button_width)
-                            .max_col_width(button_width)
-                            .show(ui, |ui| {
-                                ui.vertical_centered_justified(|ui| {
-                                    if ui.button("Previous Image").clicked() {
-                                        if self.current_image == 0 {
-                                            self.current_image = self.images.len() - 1;
-                                        } else {
-                                            self.current_image -= 1;
-                                        }
-                                    }
-                                });
-                                ui.vertical_centered_justified(|ui| {
-                                    if ui.button("Next Image").clicked() {
-                                        self.current_image =
-                                            (self.current_image + 1) % self.images.len();
-                                    }
-                                });
-                                ui.end_row();
+                    egui::Grid::new(format!("group selector grid"))
+                        .min_col_width(widget_width)
+                        .max_col_width(widget_width)
+                        .show(ui, |ui| {
+                            ui.vertical_centered_justified(|ui| {
+                                ui.heading(keys[self.current_group].deref());
                             });
-                    });
+                            ui.vertical_centered_justified(|ui| {
+                                egui::ComboBox::new("group select", "")
+                                    .selected_text("Select image group")
+                                    .width(widget_width)
+                                    .show_ui(ui, |ui| {
+                                        for (i, key) in keys.iter().enumerate() {
+                                            ui.selectable_value(
+                                                &mut self.current_group,
+                                                i,
+                                                key.deref(),
+                                            );
+                                        }
+                                    });
+                            });
+                        });
                 });
 
-                let filepath = &self.images[self.current_image];
-                ui.add(egui::Image::new(filepath).shrink_to_fit());
+                let images = &images[&keys[self.current_group]];
+                two_wide_buttons(
+                    ui,
+                    "Previous Image",
+                    "Next Image",
+                    images.len(),
+                    &mut self.current_image,
+                );
+
+                let image = &images[self.current_image];
+                ui.add(egui::Image::new(image.deref()).shrink_to_fit());
             }
         });
-
-        let _ = rayon::yield_now();
     }
 }
 
 pub enum Message {
-    ImageFilePath(String),
+    // If there are multiple images then we cycle through them
+    ImageFilePath(ArcIntern<str>, ArcIntern<str>),
     DropImages,
-    Unlock,
+    SimulationFinished,
+    AppShutdown,
+}
+
+#[derive(Default)]
+struct ImageStore {
+    images: FxHashMap<ArcIntern<str>, Vec<ArcIntern<str>>>,
+    keys: Vec<ArcIntern<str>>,
+}
+
+fn two_wide_buttons(ui: &mut Ui, prev: &str, next: &str, len: usize, val: &mut usize) {
+    ui.vertical_centered_justified(|ui| {
+        let available_space = ui.available_width();
+        let spacing = ui.style().spacing.item_spacing.x;
+        let button_width = (available_space - spacing) / 2.0;
+
+        egui::Grid::new(format!("{prev} {next} grid"))
+            .min_col_width(button_width)
+            .max_col_width(button_width)
+            .show(ui, |ui| {
+                ui.vertical_centered_justified(|ui| {
+                    if ui.button(prev).clicked() {
+                        if *val == 0 {
+                            *val = len - 1;
+                        } else {
+                            *val -= 1;
+                        }
+                    }
+                });
+                ui.vertical_centered_justified(|ui| {
+                    if ui.button(next).clicked() {
+                        *val = (*val + 1) % len;
+                    }
+                });
+            });
+    });
 }

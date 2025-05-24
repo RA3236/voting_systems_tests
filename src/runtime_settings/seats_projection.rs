@@ -1,12 +1,19 @@
-use std::usize;
+use std::{
+    process::exit, sync::{atomic::AtomicUsize, Arc}, time::{Duration, Instant}, usize
+};
 
 use charming::{
-    component::{Axis, Grid, Legend, Title}, element::AxisType, series::{Bar, Scatter}, Chart, ImageRenderer
+    component::{Axis, Grid, Legend, Title}, datatype::{DataPoint, DataPointItem}, element::{AxisType, ItemStyle, Label, LineStyle, MarkLine, MarkLineData, MarkLineVariant, Symbol}, series::{Bar, Scatter}, Chart, ImageRenderer
 };
-use egui::{text::LayoutJob, Align, FontSelection, Layout, RichText, UiBuilder};
-use methods::{MethodFn, PopulaceMethod, VectorMethod};
+use egui::{Align, Color32, FontSelection, Layout, RichText, UiBuilder, text::LayoutJob};
+use indicatif::{ParallelProgressIterator, ProgressStyle};
+use internment::ArcIntern;
+use itertools::Itertools;
+use kiddo::SquaredEuclidean;
+use methods::{Method, MethodFn, PopulaceMethod, VectorMethod};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelExtend, ParallelIterator};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{Message, runtime_settings::common::WinnerType};
 
@@ -15,14 +22,13 @@ use super::ScoreHandle;
 #[derive(Clone, Debug, PartialEq)]
 pub struct SeatsProjectionSettings {
     num_voters: usize,
-    num_voters_string: String,
     num_parties: usize,
-    num_parties_string: String,
     num_seats: usize,
-    num_seats_string: String,
+    num_iterations: usize,
+
+    watch_method: Method,
 
     max_offset: f64,
-    max_offset_string: String,
 
     save_winner_types_to_file: bool,
 }
@@ -33,50 +39,88 @@ impl Default for SeatsProjectionSettings {
             num_voters: 5000,
             num_parties: 6,
             num_seats: 151,
-            num_voters_string: 5000usize.to_string(),
-            num_parties_string: 6usize.to_string(),
-            num_seats_string: 151usize.to_string(),
-            max_offset: 4.0,
-            max_offset_string: 4.0f64.to_string(),
+            num_iterations: 1000,
+            watch_method: Method::default(),
+            max_offset: 0.75,
             save_winner_types_to_file: true,
         }
     }
 }
 
 impl SeatsProjectionSettings {
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    pub fn show(
+        &mut self,
+        available_methods: &FxHashMap<Method, Vec<ScoreHandle>>,
+        ui: &mut egui::Ui,
+    ) {
         ui.heading("Seat Projection Settings");
 
         ui.label("Simulate elections and collect seat data");
+        ui.label(
+            RichText::new(
+                "Keep iteration + seat count where they are unless you want to wait for hours!",
+            )
+            .color(Color32::RED),
+        );
 
         egui::Grid::new("Seat Projection grid").show(ui, |ui| {
-            for (name, value, value_string) in [
+            for (name, value) in [
                 (
                     "Number of voters per seat",
-                    &mut self.num_voters,
-                    &mut self.num_voters_string,
+                    &mut self.num_voters
                 ),
                 (
                     "Number of parties",
-                    &mut self.num_parties,
-                    &mut self.num_parties_string,
+                    &mut self.num_parties
                 ),
                 (
                     "Number of seats",
-                    &mut self.num_seats,
-                    &mut self.num_seats_string,
+                    &mut self.num_seats
                 ),
+                (
+                    "Number of iterations",
+                    &mut self.num_iterations
+                )
             ] {
                 ui.label(name);
-                crate::util::typed_textbox(value, value_string, ui, 1, usize::MAX);
+                //crate::util::typed_textbox(value, value_string, ui, 1, usize::MAX);
+                ui.add(
+                    egui::DragValue::new(value)
+                        .range(1..=usize::MAX)
+                );
                 ui.end_row();
             }
+
+            ui.vertical(|ui| {
+                ui.label("Method to watch");
+                ui.small("When simulating, if this method results in a change in potential governing coalitions compared to proportional voting, then those differences will be shown");
+            });
+            ui.add_enabled_ui(!available_methods.is_empty(), |ui| {
+                if !available_methods.contains_key(&self.watch_method) {
+                    if available_methods.len() > 0 {
+                        self.watch_method = available_methods.keys().copied().next().unwrap();
+                    }
+                }
+                egui::ComboBox::new("watch method", "")
+                    .selected_text(self.watch_method.name())
+                    .show_ui(ui, |ui| {
+                        for method in available_methods.keys().copied() {
+                            let name = method.name();
+                            ui.selectable_value(&mut self.watch_method, method, name);
+                        }
+                    });
+                });
+            ui.end_row();
 
             ui.vertical(|ui| {
                 ui.label("Max voter caucus offset");
                 ui.small("The voter caucus will be generated per seat based on dividing this value and moving towards either end of the spectrum");
             });
-            crate::util::typed_textbox(&mut self.max_offset, &mut self.max_offset_string, ui, 1.0, f64::MAX);
+            //crate::util::typed_textbox(&mut self.max_offset, &mut self.max_offset_string, ui, 0.0, 0.75);
+            ui.add(
+                egui::DragValue::new(&mut self.max_offset)
+                    .range(0.0..=0.75)
+            );
             ui.end_row();
 
             ui.label("Save winner type charts to directory");
@@ -85,12 +129,25 @@ impl SeatsProjectionSettings {
 
         let style = ui.style();
         let mut job = LayoutJob::default();
-        RichText::new("Will save all charts to ").append_to(&mut job, &style, FontSelection::default(), Align::Min);
-        RichText::new("output/seat_projections").code().append_to(&mut job, style, FontSelection::default(), Align::Min);
+        RichText::new("Will save all charts to ").append_to(
+            &mut job,
+            &style,
+            FontSelection::default(),
+            Align::Min,
+        );
+        RichText::new("output/seat_projections").code().append_to(
+            &mut job,
+            style,
+            FontSelection::default(),
+            Align::Min,
+        );
 
-        ui.scope_builder(UiBuilder::new().layout(Layout::top_down(Align::Min).with_cross_justify(false)), |ui| {
-            ui.label(job);
-        });
+        ui.scope_builder(
+            UiBuilder::new().layout(Layout::top_down(Align::Min).with_cross_justify(false)),
+            |ui| {
+                ui.label(job);
+            },
+        );
     }
 
     pub fn simulate(
@@ -101,7 +158,9 @@ impl SeatsProjectionSettings {
             Vec<super::ScoreHandle>,
             rustc_hash::FxBuildHasher,
         >,
-        distrs: &super::Distribution,
+        distrs: &super::DistributionManager,
+        progress: Arc<AtomicUsize>,
+        total: Arc<AtomicUsize>,
     ) {
         let sender = sender.clone();
         let methods = methods.clone();
@@ -110,9 +169,14 @@ impl SeatsProjectionSettings {
         let num_voters = self.num_voters;
         let num_parties = self.num_parties;
         let num_seats = self.num_seats;
+        let num_iterations = self.num_iterations;
+
+        let watch_method = self.watch_method;
 
         let max_offset = self.max_offset;
         let _save_to_file = self.save_winner_types_to_file;
+
+        total.store(num_iterations, std::sync::atomic::Ordering::SeqCst);
         rayon::spawn(move || {
             // Get method names and functions
             let (mut method_names, methods) = methods
@@ -134,280 +198,416 @@ impl SeatsProjectionSettings {
                 .collect::<(Vec<_>, Vec<_>)>();
             method_names.push("Proportional".to_string());
 
-            let (_, _, cx, cy) = distr.clone().into_default_distribution();
-            fn create_random<R>(
-                num: usize,
-                rng: &mut R,
-                distr: Box<dyn Fn(&mut R) -> f64>,
-            ) -> Vec<f64>
-            where
-                R: Rng,
-            {
-                (0..num).into_iter().map(|_| distr(rng)).collect()
+            // Sender/reciever for first iteration
+            let (results_sender, results_receiver) =
+                std::sync::mpsc::channel::<(usize, Vec<usize>, Vec<Vec<i64>>, Vec<Vec<f64>>)>();
+
+            // Determine method index of watched method
+            let mut watch_method_index = 0;
+            for i in 0..method_names.len() {
+                if &method_names[i] == watch_method.name() {
+                    watch_method_index = i;
+                    break;
+                }
             }
-            let mut rng = SmallRng::from_os_rng();
-            let mut cx = create_random(num_parties, &mut rng, cx);
-            let mut cy = create_random(num_parties, &mut rng, cy);
 
-            let mut indices: Vec<usize> = (0..cx.len()).collect();
-
-            indices.sort_by(|&i, &j| cx[i].total_cmp(&cx[j]));
-
-            cx = indices.iter().map(|&i| cx[i]).collect();
-            cy = indices.iter().map(|&i| cy[i]).collect();
-
-            // We need to calculate multiple things here:
-            // 1. The average voter for each round
-            // 2. The Condorcet winner for each round
-            // 3. The seat winner for each method
-            // Note that unlike the usual simulations, the average voter is different every seat
-            // We store the results in three different
+            let methods_len = method_names.len();
+            let len_wo_prop = methods_len - 1;
             let main_data = SeatsProjectionMainData::new(
                 distr,
-                &cx,
-                &cy,
                 max_offset,
                 num_voters,
                 num_parties,
                 num_seats,
+                num_iterations,
             );
-
-            // Collect results
-            let results = (0..num_seats)
+            // Perform all iterations
+            let iteration_results = (0..num_iterations)
                 .into_par_iter()
-                .map(|seat_num| {
-                    // Get the offset voter positions
-                    let offset_voters = main_data.offset_into(seat_num);
-                    // Calculate the average voter
-                    let (ax, ay) = methods::average_voter(
-                        &offset_voters.vx,
-                        &offset_voters.vy,
-                        offset_voters.num_voters,
-                    );
-                    let average_voter = [ax, ay];
-                    // Calculate the closest-to-average party
-                    // We can do this manually here
-                    let closest_to_average_party = cx
-                        .iter()
-                        .copied()
-                        .zip(cy.iter().copied())
-                        .enumerate()
-                        .map(|(i, (cx, cy))| (i, ((ax - cx).powi(2) + (ay - cy).powi(2)).sqrt()))
-                        .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                        .map(|(i, _)| i)
-                        .unwrap();
-
-                    // Get the populace
-                    let populace = offset_voters.create_populace();
-
-                    // Get the Condorcet winner, if they exist
-                    let condorcet_winner = methods::condorcet(&populace).unwrap();
-
-                    // Calculate per-method results, compare with condorcet to get winner type as well
-                    let (main_results, winner_types) = methods
-                        .iter()
-                        .map(|func| {
-                            let result = func(&populace).unwrap();
-                            let winner_type = match condorcet_winner {
-                                Some(condorcet_winner) => {
-                                    if result == condorcet_winner {
-                                        if result == closest_to_average_party {
-                                            WinnerType::CondorcetAndAverage
-                                        } else {
-                                            WinnerType::CondorcetButNotAverage
-                                        }
-                                    } else if result == closest_to_average_party {
-                                        WinnerType::NotCondorcetButAverage
-                                    } else {
-                                        WinnerType::NotCondorcetAndNotAverage
-                                    }
-                                }
-                                None => {
-                                    if result == closest_to_average_party {
-                                        WinnerType::NoCondorcetButAverage
-                                    } else {
-                                        WinnerType::NoCondorcetAndNotAverage
-                                    }
-                                }
-                            };
-                            (result, winner_type)
-                        })
-                        .collect::<(Vec<_>, Vec<_>)>();
-
-                    (
-                        seat_num,
-                        main_results,
-                        average_voter,
-                        closest_to_average_party,
-                        condorcet_winner,
-                        winner_types,
+                .progress_with_style(
+                    ProgressStyle::with_template(
+                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
                     )
-                })
-                .collect::<Vec<_>>();
+                    .unwrap(),
+                )
+                .map_with(
+                    (
+                        // Main Results
+                        vec![Vec::new(); num_seats],
+                        // Proportional votes
+                        vec![0; num_parties],
+                        // Main results data
+                        vec![vec![0i64; methods_len]; num_parties],
+                        // Sainte-Lague Allocated seats
+                        vec![0i64; num_parties],
+                    ),
+                    |
+                        (
+                            main_results,
+                            proportional_votes,
+                            main_results_data,
+                            allocated_seats,
+                        ),
+                        iter
+                    |{
 
-            let mut main_results = vec![Vec::new(); num_seats];
-            let mut average_voters = vec![[0.0, 0.0]; num_seats];
-            let mut closest_to_average_parties = vec![0; num_seats];
-            let mut condorcet_winners = vec![None; num_seats];
-            let mut winner_types = vec![Vec::new(); num_seats];
+                    // We need to calculate multiple things here:
+                    // 1. The average voter for each round
+                    // 2. The Condorcet winner for each round
+                    // 3. The seat winner for each method
+                    // Note that unlike the usual simulations, the average voter is different every seat
+                    // We store the results in three different
+                    let main_data = main_data.get_iter_data(iter);
 
-            results
-                .into_iter()
-                .for_each(|(seat_num, main, average, closest, condorcet, ty)| {
-                    main_results[seat_num] = main;
-                    average_voters[seat_num] = average;
-                    closest_to_average_parties[seat_num] = closest;
-                    condorcet_winners[seat_num] = condorcet;
-                    winner_types[seat_num] = ty;
-                });
-
-            // Show the seat counts for each of the methods
-            // First calculate using party lists to compare with proportional
-            let populace = main_data.create_populace();
-            let mut proportional_votes = vec![0usize; num_parties];
-            populace.populace
-                .iter()
-                .for_each(|voter| {
-                    proportional_votes[voter
+                    // Collect results
+                    (0..num_seats)
                         .into_iter()
-                        .enumerate()
-                        .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                        .map(|(i, _)| i)
-                        .unwrap()] += 1;
-                });
-            
-            let methods_len = method_names.len();
-            let len_wo_prop = methods_len - 1;
+                        .map(|seat_num| {
+                            // Get the populace
+                            let populace = main_data.get_populace(seat_num);
 
-            // Now we calculate the number of seats each party got for each method
-            // Result data is currently in form [seat][method] -> party
-            // We need it in the form [party][method] -> count
-            let mut main_results_data = vec![vec![0i64; methods_len]; num_parties];
-            for seat in 0..num_seats {
-                for method in 0..len_wo_prop {
-                    let party = main_results[seat][method];
-                    main_results_data[party][method] += 1;
-                }
-            }
-            
-            // Sainte-Lague method for PLPR
-            let mut allocated_seats = vec![0i64; num_parties];
-            for _ in 0..num_seats {
-                // Calculate quotients
-                let mut quotients = proportional_votes
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(i, v)| (i, v as i64 / (2 * allocated_seats[i] + 1)))
-                    .collect::<Vec<_>>();
-                quotients.sort_by(|(_, a), (_, b)| b.cmp(a));
-                let winner = quotients[0].0;
-                allocated_seats[winner] += 1;
-            }
-            // Splat into method results
-            for party in 0..num_parties {
-                main_results_data[party][len_wo_prop] += allocated_seats[party];
+                            // Calculate per-method results, compare with condorcet to get winner type as well
+                            let main_results = methods
+                                .iter()
+                                .map(|func| {
+                                    func(&populace).unwrap()
+                                })
+                                .collect::<Vec<_>>();
+
+                            (
+                                seat_num,
+                                main_results,
+                            )
+                        })
+                        .for_each(|(seat_num, main)| {
+                            main_results[seat_num] = main;
+                        });
+
+                    // Show the seat counts for each of the methods
+                    // First calculate using party lists to compare with proportional
+                    proportional_votes.fill(0);
+                    (0..num_seats).into_iter().for_each(|i| {
+                        let populace = main_data.get_populace(i);
+                        populace
+                            .iter_populace(&mut |voter: &[f64]| {
+                                proportional_votes[voter
+                                    .into_iter()
+                                    .enumerate()
+                                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                                    .map(|(i, _)| i)
+                                    .unwrap()] += 1;
+                            })
+                            .unwrap();
+                    });
+
+                    // Now we calculate the number of seats each party got for each method
+                    // Result data is currently in form [seat][method] -> party
+                    // We need it in the form [party][method] -> seat_count
+                    for party in 0..num_parties {
+                        main_results_data[party].fill(0i64);
+                    }
+                    for seat in 0..num_seats {
+                        for method in 0..len_wo_prop {
+                            let party = main_results[seat][method];
+                            main_results_data[party][method] += 1;
+                        }
+                    }
+
+                    // Sainte-Lague method for PLPR
+                    allocated_seats.fill(0i64);
+                    for _ in 0..num_seats {
+                        // Calculate quotients
+                        let winner = proportional_votes
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(i, v)| (i, v as i64 / (2 * allocated_seats[i] + 1)))
+                            .max_by(|(_, a), (_, b)| a.cmp(b))
+                            .map(|(i, _)| i)
+                            .unwrap();
+                        allocated_seats[winner] += 1;
+                    }
+                    // Splat into method results
+                    for party in 0..num_parties {
+                        main_results_data[party][len_wo_prop] += allocated_seats[party];
+                    }
+
+                    // Go through every combination of party, and determine if the result for the
+                    // watch method is different to proportional
+                    let mut different = vec![false; len_wo_prop];
+                    let mut sent = false;
+                    let parties = (0..num_parties)
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    for length in 1..num_parties {
+                        let diff = parties
+                            .windows(length)
+                            .filter_map(|parties| {
+                                // Get proportional count
+                                let prop: i64 = parties
+                                    .iter()
+                                    .copied()
+                                    .map(|i| {
+                                        main_results_data[i][len_wo_prop]
+                                    })
+                                    .sum();
+                                // Get the counts for each method
+                                if (0..methods_len)
+                                    .into_iter()
+                                    .map(|method| {
+                                        parties
+                                            .iter()
+                                            .copied()
+                                            .map(|party| {
+                                                main_results_data[party][method]
+                                            })
+                                            .sum::<i64>()
+                                    })
+                                    .enumerate()
+                                    .any(|(i, method)| {
+                                        let winning_count = num_seats as i64 / 2 + 1;
+                                        let matched = prop >= winning_count && method < winning_count || prop < winning_count && method >= winning_count;
+                                        if matched {
+                                            different[i] = true;
+                                            if i == watch_method_index {
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    }) {
+                                        Some(parties)
+                                    } else {
+                                        None
+                                    }
+                            })
+                            .next();
+                        if !sent {
+                            if let Some(parties) = diff {
+                                let (cx, cy) = main_data.get_candidates();
+                                let party_positions = (0..num_parties)
+                                    .into_iter()
+                                    .map(|i| vec![cx[i], cy[i]])
+                                    .collect();
+                                results_sender.send((
+                                    iter,
+                                    parties.to_vec(),
+                                    main_results_data.clone(),
+                                    party_positions
+                                )).unwrap();
+                                sent = true;
+                            }
+                        }
+                    }
+                    progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                    different
+                })
+                .fold(|| vec![0i64; len_wo_prop], |mut accum, diff| {
+                    for i in 0..len_wo_prop {
+                        accum[i] += diff[i] as i64
+                    }
+                    accum
+                })
+                .reduce(|| vec![0i64; len_wo_prop], |mut a, b| {
+                    for i in 0..len_wo_prop {
+                        a[i] += b[i];
+                    }
+                    a
+                });
+
+            let instant = Instant::now();
+            // Force wait until we are certain the results have come back
+            while instant.elapsed() < Duration::from_secs(1) {
+                rayon::yield_now();
             }
 
             let party_names = (0..num_parties)
                 .into_iter()
                 .map(|i| format!("Party {i}"))
                 .collect::<Vec<_>>();
-            let party_positions = (0..num_parties)
-                .into_iter()
-                .map(|i| {
-                    vec![cx[i], cy[i]]
-                })
-                .collect::<Vec<_>>();
-
-            let mut chart = Chart::new()
-                .legend(Legend::new().top("bottom").left("center").show(true))
-                .x_axis(Axis::new().type_(AxisType::Value))
-                .y_axis(Axis::new().type_(AxisType::Category).data(method_names.clone()))
-                .grid(Grid::new().left("center").top("middle"))
-                .title(Title::new().text("Seat Projections").left("center"))
-                .background_color("#ffffff");
-            for i in 0..num_parties {
-                let name = party_names[i].clone();
-                let data = main_results_data[i].clone();
-                chart = chart.series(
-                    Bar::new()
-                        .name(name)
-                        .stack("total")
-                        .bar_width("80%")
-                        .data(data),
-                )
-            }
 
             let mut renderer = ImageRenderer::new(800, 500);
-            let (save_file, uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "seat projections.svg");
-            renderer.save(&chart, &save_file).unwrap();
-            sender
-                .send(Message::ImageFilePath(uri))
-                .unwrap();
 
-            let mut labels = party_names.clone();
-            labels.push(format!("Seats"));
-            // Visualise candidate positions
-            let mut chart = Chart::new()
-                .legend(Legend::new().top("bottom").left("center").show(true))
-                .title(Title::new().text("Party/Seat Positions").left("center"))
-                .x_axis(Axis::new().min(0.0).max(1.0))
-                .y_axis(Axis::new().min(0.0).max(1.0))
-                .background_color("#ffffff");
-            for i in 0..num_parties {
-                let name = party_names[i].clone();
-                let position = vec![party_positions[i].clone()];
-                chart = chart.series(
-                    Scatter::new()
-                        .name(name)
-                        .data(position)
+            // Plot number of times the result was different to proportional
+            let chart = Chart::new()
+                .y_axis(Axis::new().type_(AxisType::Category).data(method_names[0..len_wo_prop].to_vec()))
+                .x_axis(Axis::new().type_(AxisType::Value))
+                .grid(Grid::new().left("center").top("middle"))
+                .series(
+                    Bar::new()
+                        .data(iteration_results)
                 )
+                .title(Title::new().text("# Different Governments from Proportional").left("center"))
+                .background_color("#ffffff");
+            let (save_path, uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "differences.svg");
+            renderer.save(&chart, save_path).unwrap();
+            sender.send(Message::ImageFilePath(ArcIntern::from("Seat Projections"), ArcIntern::from(uri))).unwrap();
+
+            // Plot both the voters and candidates, so we know where they are
+            let (vx, vy) = (&main_data.vx, &main_data.vy);
+            let (cx, cy) = (&main_data.cx, &main_data.cy);
+            let (voters_save_file, voters_uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "voters.svg");
+            let (parties_save_file, parties_uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "parties.svg");
+            super::common::density::<SquaredEuclidean, _>((vx.as_ref(), vy.as_ref()), &sender, "Voters", &voters_save_file, &voters_uri, "Seat Projections (Data)");
+            super::common::density::<SquaredEuclidean, _>((cx.as_ref(), cy.as_ref()), &sender, "Parties", &parties_save_file, &parties_uri, "Seat Projections (Data)");
+
+            for (iter, method_party_diff, main_results_data, party_positions) in results_receiver.try_iter().take(5) {
+
+                // Convert main_results_data into datapoint vec
+                let main_results_data: Vec<Vec<DataPoint>> = main_results_data
+                    .into_iter()
+                    .enumerate()
+                    .map(|(party, data)| {
+                        let datapoint: Vec<DataPoint> = data
+                            .into_iter()
+                            .enumerate()
+                            .map(|(method, method_data)| {
+                                match method_party_diff.contains(&party) {
+                                    true => {
+                                        DataPointItem::new(method_data)
+                                            .item_style(
+                                                ItemStyle::new()
+                                                    .border_color(
+                                                        if method == watch_method_index {
+                                                            "#FF0000"
+                                                        } else {
+                                                            "#000000"
+                                                        }
+                                                    )
+                                                    .border_width(1.0)
+                                            ).into()
+                                    },
+                                    false => {
+                                        DataPointItem::new(method_data).into()
+                                    }
+                                }
+                            })
+                            .collect::<Vec<DataPoint>>();
+                        datapoint
+                    })
+                    .collect();
+                
+                // Plot seat projections
+                let mut chart = Chart::new()
+                    .legend(Legend::new().top("bottom").left("center").show(true))
+                    .x_axis(Axis::new().type_(AxisType::Value))
+                    .y_axis(
+                        Axis::new()
+                            .type_(AxisType::Category)
+                            .data(method_names.clone()),
+                    )
+                    .grid(Grid::new().left("center").top("middle"))
+                    .title(
+                        Title::new()
+                            .text(format!("Seat Projections ({iter})"))
+                            .left("center"),
+                    )
+                    .background_color("#ffffff");
+                for i in 0..num_parties {
+                    let name = party_names[i].clone();
+                    let data = main_results_data[i].clone();
+                    chart = chart.series({
+                        let mut bar = Bar::new()
+                            .name(name)
+                            .stack("total")
+                            .bar_width("80%")
+                            .label(Label::new().show(true))
+                            .data(data);
+                        if i == 0 {
+                            bar = bar.mark_line(
+                                MarkLine::new()
+                                    .data(vec![MarkLineVariant::Simple(
+                                        MarkLineData::new().name("Majority").x_axis(76),
+                                    )])
+                                    .line_style(LineStyle::new().color("black"))
+                                    .symbol(vec![Symbol::Circle, Symbol::Circle]),
+                            );
+                        }
+                        bar
+                    })
+                }
+
+                let (save_file, uri) = super::get_file_and_uri(
+                    super::SAVE_SEATS_PROJECTION,
+                    &format!("seat projections ({iter}).svg"),
+                );
+                renderer.save(&chart, &save_file).unwrap();
+                sender
+                    .send(Message::ImageFilePath(
+                        ArcIntern::from(format!("({iter}) Seat Projections")),
+                        ArcIntern::from(uri),
+                    ))
+                    .unwrap();
+
+                // Visualise candidate positions
+                let mut chart = Chart::new()
+                    .legend(Legend::new().top("bottom").left("center").show(true))
+                    .title(
+                        Title::new()
+                            .text(format!("Seat Projections ({iter})"))
+                            .left("center"),
+                    )
+                    .x_axis(Axis::new().min(0.0).max(1.0))
+                    .y_axis(Axis::new().min(0.0).max(1.0))
+                    .background_color("#ffffff");
+                for i in 0..num_parties {
+                    let name = party_names[i].clone();
+                    let position = vec![party_positions[i].clone()];
+                    chart = chart.series(
+                        Scatter::new().name(name).data(position).mark_line(
+                            MarkLine::new()
+                                .data(vec![MarkLineVariant::Simple(
+                                    MarkLineData::new().name("Midpoint").x_axis(0.5),
+                                ), MarkLineVariant::Simple(
+                                    MarkLineData::new().name("Midpoint").y_axis(0.5),
+                                )])
+                                .line_style(LineStyle::new().color("black"))
+                                .symbol(vec![Symbol::Circle, Symbol::Circle]),
+                        ),
+                    )
+                }
+
+                let (save_file, uri) = super::get_file_and_uri(
+                    super::SAVE_SEATS_PROJECTION,
+                    &format!("positions ({iter}).svg"),
+                );
+
+                renderer.save(&chart, &save_file).unwrap();
+                sender
+                    .send(Message::ImageFilePath(
+                        ArcIntern::from(format!("({iter}) Seat Projections")),
+                        ArcIntern::from(uri),
+                    ))
+                    .unwrap();
             }
-            let average_voters = average_voters
-                .into_iter()
-                .map(|[x, y]| vec![x, y])
-                .collect::<Vec<_>>();
-            chart = chart.series(
-                Scatter::new()
-                    .name("Seats")
-                    .data(average_voters)
-            );
-
-            let (save_file, uri) = super::get_file_and_uri(super::SAVE_SEATS_PROJECTION, "positions.svg");
-
-            renderer.save(&chart, &save_file).unwrap();
-            sender
-                .send(Message::ImageFilePath(uri))
-                .unwrap();
-
-            sender.send(Message::Unlock).unwrap();
+            sender.send(Message::SimulationFinished).unwrap();
         });
     }
 }
 
-pub struct SeatsProjectionMainData<'a> {
+pub struct SeatsProjectionMainData {
     vx: Vec<f64>,
     vy: Vec<f64>,
-    cx: &'a [f64],
-    cy: &'a [f64],
-    offsets: Vec<f64>,
+    cx: Vec<f64>,
+    cy: Vec<f64>,
     num_voters: usize,
     num_parties: usize,
     num_seats: usize,
 }
 
-impl<'a> SeatsProjectionMainData<'a> {
+impl SeatsProjectionMainData {
     pub fn new(
-        distr: super::Distribution,
-        cx: &'a [f64],
-        cy: &'a [f64],
+        distr: super::DistributionManager,
         max_offset: f64,
         num_voters: usize,
         num_parties: usize,
         num_seats: usize,
+        num_iterations: usize,
     ) -> Self {
-        let (vx, vy, _, _) = distr.into_default_distribution();
+        let (vxd, vyd, cxd, cyd) = distr.into_default_distribution();
 
         let mut rng = SmallRng::from_os_rng();
 
@@ -418,111 +618,117 @@ impl<'a> SeatsProjectionMainData<'a> {
             (0..num).into_iter().map(|_| distr(rng)).collect()
         }
 
-        let vx = create_random(num_voters, &mut rng, vx);
-        let vy = create_random(num_voters, &mut rng, vy);
+        let vx1 = create_random(num_voters, &mut rng, vxd);
+        let vy = create_random(num_voters * num_seats, &mut rng, vyd);
 
-        let mut offsets = Vec::with_capacity(num_seats);
-        let one_side = max_offset - 1.0;
-        let step_size = one_side / (num_seats / 2) as f64;
-        let mut start = -max_offset;
-        for _ in 0..(num_seats / 2) {
-            offsets.push(start);
+        let mut cx = create_random(num_parties * num_iterations, &mut rng, cxd);
+        let cy = create_random(num_parties * num_iterations, &mut rng, cyd);
+
+        // Sort every subpart of cx so that we are in order
+        for i in 0..num_iterations {
+            let cx = &mut cx[(i * num_parties)..((i + 1) * num_parties)];
+            cx.sort_by(|a, b| a.total_cmp(b));
+        }
+
+        let mut midpoints = vec![0.0; num_seats];
+
+        let lower = (1.0 - max_offset) / 2.0;
+        let step_size = max_offset / num_seats as f64;
+
+        let mut start = lower;
+        let mut i = 0;
+        for _ in 0..num_seats {
+            midpoints[i] = start;
             start += step_size;
+            i += 1;
         }
-        if num_seats % 2 == 1 {
-            offsets.push(1.0);
-        }
-        start = 1.0 + step_size;
-        for _ in 0..(num_seats / 2) {
-            offsets.push(start);
-            start += step_size;
-        }
+
+        // Create the full VX array
+        let vx = midpoints
+            .into_iter()
+            .flat_map(|b| {
+                let (a, c) = if b <= 0.5 {
+                    (0.0, 2.0 * b)
+                } else {
+                    (1.0 - 2.0 * (1.0 - b), 1.0)
+                };
+                vx1.iter().copied().map(move |x| {
+                    a + ((c - a) * x)
+                })
+            })
+            .collect::<Vec<_>>();
 
         Self {
             vx,
             vy,
             cx,
             cy,
-            offsets,
             num_voters,
             num_parties,
-            num_seats: 1, // This is a single seat
+            num_seats,
         }
     }
 
-    pub fn offset_into(&'a self, i: usize) -> Self {
-        let offset = *self
-            .offsets
-            .get(i)
-            .expect(&format!("cannot offset into this struct more than once: {i}, {}", self.offsets.len()));
+    pub fn get_iter_data(&self, iter: usize) -> IterData {
+        let cx = &self.cx[(iter * self.num_parties)..((iter + 1) * self.num_parties)];
+        let cy = &self.cy[(iter * self.num_parties)..((iter + 1) * self.num_parties)];
 
-        let abs_scale = offset.abs();
-        let scaled_vx = self
-            .vx
-            .iter()
-            .copied()
-            .map(|x| {
-                if offset > 0.0 {
-                    x / abs_scale
-                } else {
-                    1.0 - (x / abs_scale)
-                }
+        // Calculate all populace
+        let populace = (0..self.num_seats)
+            .into_iter()
+            .map(|seat| {
+                crate::util::create_populace(
+                    &self.vx[(seat * self.num_voters)..((seat + 1) * self.num_voters)],
+                    &self.vy,
+                    cx,
+                    cy,
+                    self.num_parties,
+                )
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        Self {
-            vx: scaled_vx,
-            vy: self.vy.clone(),
-            cx: self.cx,
-            cy: self.cy,
-            offsets: Vec::new(),
+        IterData {
+            vx: &self.vx,
+            vy: &self.vy,
+            cx,
+            cy,
             num_voters: self.num_voters,
             num_parties: self.num_parties,
-            num_seats: self.num_seats,
-        }
-    }
-
-    pub fn create_populace(&self) -> SeatsProjectionPopulace {
-        SeatsProjectionPopulace {
-            populace: crate::util::create_populace(
-                &self.vx,
-                &self.vy,
-                &self.cx,
-                &self.cy,
-                self.num_parties,
-            ),
-            num_parties: self.num_parties,
+            populace,
         }
     }
 }
 
-impl<'a> VectorMethod for SeatsProjectionMainData<'a> {
-    fn into_data<'b>(
-        &'b self,
-    ) -> (
-        (&'b [f64], &'b [f64]),
-        (&'a [f64], &'a [f64]),
-        usize,
-        usize,
-        usize,
-    ) {
-        (
-            (&self.vx, &self.vy),
-            (self.cx, self.cy),
-            self.num_voters,
-            self.num_parties,
-            self.num_seats,
-        )
-    }
-}
-
-pub struct SeatsProjectionPopulace {
-    populace: Vec<Vec<f64>>,
+pub struct IterData<'a> {
+    vx: &'a [f64],
+    vy: &'a [f64],
+    cx: &'a [f64],
+    cy: &'a [f64],
+    populace: Vec<Vec<Vec<f64>>>,
+    num_voters: usize,
     num_parties: usize,
 }
 
-impl PopulaceMethod<usize> for SeatsProjectionPopulace {
-    fn populace<'a>(&'a self) -> &'a [Vec<f64>] {
+impl<'a> IterData<'a> {
+    pub fn get_populace(&'a self, seat: usize) -> SeatsProjectionPopulace<'a> {
+        SeatsProjectionPopulace {
+            populace: &self.populace[seat],
+            num_parties: self.num_parties,
+        }
+    }
+
+    pub fn get_candidates(&'a self) -> (&'a [f64], &'a [f64]) {
+        (&self.cx, &self.cy)
+    }
+}
+
+pub struct SeatsProjectionPopulace<'a> {
+    populace: &'a [Vec<f64>],
+    num_parties: usize,
+}
+
+impl<'a> PopulaceMethod<usize> for SeatsProjectionPopulace<'a> {
+    fn populace<'b>(&'b self) -> &'b [Vec<f64>] {
         &self.populace
     }
 

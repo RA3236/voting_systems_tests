@@ -1,7 +1,140 @@
+use std::sync::LazyLock;
+
+use charming::{component::{Axis, Title, VisualMap, VisualMapChannel}, datatype::DataPoint, df, element::{AxisType, Orient}, series::Heatmap, Chart, ImageRenderer};
+use internment::ArcIntern;
+use kiddo::{traits::DistanceMetric, KdTree};
 use methods::{PopulaceMethod, VectorMethod};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
-use super::Distribution;
+use crate::Message;
+
+use super::DistributionManager;
+use super::constants::*;
+
+pub fn linspace(start: f64, end: f64, steps: usize, endpoint: bool) -> Vec<f64> {
+    let step_size = (end - start) / (steps - endpoint as usize) as f64;
+    (0..steps)
+        .into_iter()
+        .map(|i| start + (i as f64 * step_size))
+        .collect()
+}
+
+/// Bar chart with multiple series
+/// 
+/// This assumes that all stacked bars will sum up nicely to the same value.
+
+/// Visualize a set of points
+pub fn density<D: DistanceMetric<f64, 2>, V: IntoDistanceCount<D>>(
+    values: V,
+    sender: &std::sync::mpsc::Sender<crate::Message>,
+    title: &str,
+    save_file: &str,
+    uri: &str,
+    category: &str
+) {
+    let (max, z) = values.into_kdtree(&DENSITY_X, &DENSITY_Y);
+
+    let chart = Chart::new()
+        .x_axis(
+            Axis::new()
+                .type_(AxisType::Category)
+                .data(
+                    DENSITY_X_LABELS.to_vec()
+                )
+        )
+        .y_axis(
+            Axis::new()
+                .type_(AxisType::Category)
+                .data(
+                    DENSITY_Y_LABELS.to_vec()
+                )
+        )
+        .title(
+            Title::new()
+                .left("center")
+                .text(title)
+        )
+        .background_color("#ffffff")
+        .visual_map(
+            VisualMap::new()
+                .min(0.0)
+                .max(max as f64)
+                .calculable(true)
+                .orient(Orient::Horizontal)
+                .left("center")
+                .in_range(VisualMapChannel::new().color(vec![
+                    "#313695", "#4575b4", "#74add1", "#abd9e9", "#e0f3f8", "#ffffbf",
+                    "#fee090", "#fdae61", "#f46d43", "#d73027", "#a50026",
+                ])),
+        )
+        .series(
+            Heatmap::new()
+                .data(z)
+                .name(title)
+        );
+    
+    let mut renderer = ImageRenderer::new(400, 400);
+    renderer.save(&chart, save_file).unwrap();
+
+    sender.send(Message::ImageFilePath(ArcIntern::from(category), ArcIntern::from(uri))).unwrap();
+}
+
+pub trait IntoDistanceCount<D: DistanceMetric<f64, 2>> {
+    fn into_kdtree(self, x: &[f64], y: &[f64]) -> (i64, Vec<Vec<DataPoint>>);
+
+    fn into_datapoints(kdtree: KdTree<f64, 2>, x: &[f64], y: &[f64]) -> (i64, Vec<Vec<DataPoint>>) {
+        let kdtree = &kdtree;
+
+        let mut max = 0;
+
+        let radius = D::dist(&[0.01, 0.01], &[0.0, 0.0]);
+
+        let z = x
+            .into_iter()
+            .copied()
+            .zip(DENSITY_X_LABELS.iter())
+            .flat_map(|(x, xname)| {
+                y
+                    .into_iter()
+                    .copied()
+                    .zip(DENSITY_Y_LABELS.iter())
+                    .map(|(y, yname)| {
+                        let count = kdtree
+                            .within_unsorted_iter::<D>(
+                                &[x, y],
+                                radius
+                            )
+                            .count() as i64;
+                        max = max.max(count);
+                        df![xname.clone(), yname.clone(), count]
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (max, z)
+    }
+}
+
+impl<D: DistanceMetric<f64, 2>> IntoDistanceCount<D> for Vec<[f64; 2]> {
+    fn into_kdtree(self, x: &[f64], y: &[f64]) -> (i64, Vec<Vec<DataPoint>>) {
+        let kdtree = KdTree::from(&self);
+        <Self as IntoDistanceCount<D>>::into_datapoints(kdtree, x, y)
+    }
+}
+
+impl<'a, D: DistanceMetric<f64, 2>> IntoDistanceCount<D> for (&'a [f64], &'a [f64]) {
+    fn into_kdtree(self, x: &[f64], y: &[f64]) -> (i64, Vec<Vec<DataPoint>>) {
+        let kdtree = self.0
+            .into_iter()
+            .copied()
+            .zip(self.1.into_iter().copied())
+            .map(|(x, y)| [x, y])
+            .enumerate()
+            .map(|(i, v)| (v, i as u64))
+            .collect::<KdTree<f64, 2>>();
+        <Self as IntoDistanceCount<D>>::into_datapoints(kdtree, x, y)
+    }
+}
 
 macro_rules! define_winner_type {
     ($($name:ident, $str:expr),*) => {
@@ -69,7 +202,7 @@ impl VectorMethod for StandardData {
 
 impl StandardData {
     pub fn new(
-        distr: Distribution,
+        distr: DistributionManager,
         num_voters: usize,
         num_candidates: usize,
         num_iterations: usize,

@@ -1,4 +1,9 @@
-use std::{f64, fmt::Display, usize};
+use std::{
+    f64,
+    fmt::Display,
+    sync::{Arc, atomic::AtomicUsize},
+    usize,
+};
 
 use dist_to_average::DistanceSettings;
 use egui::{Color32, PopupCloseBehavior, RichText};
@@ -10,9 +15,10 @@ use seats_projection::SeatsProjectionSettings;
 use visualize_distribution::VisualizeDistribution;
 use winner_type::WinnerTypeSettings;
 
-use crate::{Message, Sender};
+use crate::{Message, MessageSender};
 
 pub mod common;
+pub mod constants;
 pub mod dist_to_average;
 pub mod seats_projection;
 pub mod visualize_distribution;
@@ -30,19 +36,22 @@ pub fn get_file_and_uri(loc: &str, filename: &str) -> (String, String) {
     (save_path, uri)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct AppRuntimeSettings {
     locked: bool,
     num_locks: usize,
     current: usize,
     actions: FxHashSet<Action>,
     methods: FxHashMap<Method, Vec<ScoreHandle>>,
-    distrs: Distribution,
+    distrs: DistributionManager,
 
     visualize: VisualizeDistribution,
     winner_types: WinnerTypeSettings,
     distances: DistanceSettings,
     seat_projections: SeatsProjectionSettings,
+
+    progress: Vec<(&'static str, Arc<AtomicUsize>)>,
+    totals: Vec<Arc<AtomicUsize>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,7 +71,12 @@ impl Display for ScoreHandle {
 
 impl Default for AppRuntimeSettings {
     fn default() -> Self {
-        for location in [SAVE_VISUALIZE, SAVE_WINNER_TYPE, SAVE_DISTANCES, SAVE_SEATS_PROJECTION] {
+        for location in [
+            SAVE_VISUALIZE,
+            SAVE_WINNER_TYPE,
+            SAVE_DISTANCES,
+            SAVE_SEATS_PROJECTION,
+        ] {
             let dir_name = format!("{SAVE_LOCATION}/{location}");
             std::fs::create_dir_all(dir_name).unwrap();
         }
@@ -73,16 +87,32 @@ impl Default for AppRuntimeSettings {
             num_locks: 0,
             actions: FxHashSet::default(),
             methods: FxHashMap::default(),
-            distrs: Distribution::default(),
+            distrs: DistributionManager::default(),
             visualize: VisualizeDistribution::default(),
             winner_types: WinnerTypeSettings::default(),
             distances: DistanceSettings::default(),
             seat_projections: SeatsProjectionSettings::default(),
+            progress: vec![],
+            totals: vec![],
         }
     }
 }
 
 impl AppRuntimeSettings {
+    pub fn progress(&self) -> impl Iterator<Item = (&'static str, f64)> {
+        self.progress
+            .iter()
+            .zip(self.totals.iter())
+            .map(|((name, progress), total)| {
+                (
+                    *name,
+                    progress.load(std::sync::atomic::Ordering::SeqCst),
+                    total.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+            .map(|(name, progress, total)| (name, progress as f64 / total as f64))
+    }
+
     pub fn unlock(&mut self) {
         self.current += 1;
         if self.num_locks == self.current {
@@ -98,7 +128,7 @@ impl AppRuntimeSettings {
         self.methods.iter().map(|(_, v)| v.len()).sum()
     }
 
-    pub fn show(&mut self, sender: &Sender, ui: &mut egui::Ui) {
+    pub fn show(&mut self, sender: &MessageSender, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.vertical_centered_justified(|ui| {
                 ui.heading("Voting Simulations");
@@ -108,23 +138,42 @@ impl AppRuntimeSettings {
                     self.num_locks = self.actions.len();
                     self.current = 0;
                     sender.send(Message::DropImages).unwrap();
+                    self.progress.clear();
+                    self.totals.clear();
 
-                    for action in &self.actions {
+                    for (i, action) in self.actions.iter().enumerate() {
+                        self.progress
+                            .push((action.to_str(), Arc::new(AtomicUsize::new(0))));
+                        self.totals.push(Arc::new(AtomicUsize::new(0)));
                         match action {
-                            Action::VisualizeDistribution => {
-                                self.visualize.simulate(sender, &self.methods, &self.distrs)
-                            }
-                            Action::WinnerType => {
-                                self.winner_types
-                                    .simulate(sender, &self.methods, &self.distrs)
-                            }
-                            Action::Distance => {
-                                self.distances.simulate(sender, &self.methods, &self.distrs)
-                            }
-                            Action::SimulateElection => {
-                                self.seat_projections
-                                    .simulate(sender, &self.methods, &self.distrs)
-                            }
+                            Action::VisualizeDistribution => self.visualize.simulate(
+                                sender,
+                                &self.methods,
+                                &self.distrs,
+                                self.progress[i].1.clone(),
+                                self.totals[i].clone(),
+                            ),
+                            Action::WinnerType => self.winner_types.simulate(
+                                sender,
+                                &self.methods,
+                                &self.distrs,
+                                self.progress[i].1.clone(),
+                                self.totals[i].clone(),
+                            ),
+                            Action::Distance => self.distances.simulate(
+                                sender,
+                                &self.methods,
+                                &self.distrs,
+                                self.progress[i].1.clone(),
+                                self.totals[i].clone(),
+                            ),
+                            Action::SimulateElection => self.seat_projections.simulate(
+                                sender,
+                                &self.methods,
+                                &self.distrs,
+                                self.progress[i].1.clone(),
+                                self.totals[i].clone(),
+                            ),
                         }
                     }
                 }
@@ -210,7 +259,8 @@ impl AppRuntimeSettings {
                         }
                         Action::WinnerType => self.winner_types.show(ui),
                         Action::Distance => self.distances.show(ui),
-                        Action::SimulateElection => self.seat_projections.show(ui),
+                        Action::SimulateElection => self.seat_projections.show(&self.methods, ui),
+                        _ => {}
                     });
                 }
 
@@ -292,33 +342,43 @@ impl AppRuntimeSettings {
 
 macro_rules! define_distribution {
     (
-        $dname:ident, $dstr:expr, ($dtyf:ident $(, $dty:ident)* $(,)?), ($dvf:expr $(, $dv:expr)* $(,)?),
-        $($name:ident, $str:expr, ($tyf:ident $(, $ty:ident)* $(,)?), ($vf:expr $(, $v:expr)* $(,)?)),*
+        $default_name:ident, $default_str:literal, ($($default_ty:ty),*), ($($default_voters:literal),*), ($($default_candidates:literal),*),
+        $($name:ident, $str:literal, ($($ty:ty),*), ($($voters:literal),*), ($($candidates:literal),*)),*
     ) => {
         #[derive(Clone, Debug, PartialEq)]
         pub enum Distribution {
-            $dname($dtyf, String, $($dty, String),*),
-            $($name($tyf, String, $($ty, String),*)),*
-        }
-
-        impl Default for Distribution {
-            fn default() -> Self {
-                Self::$dname($dvf, $dtyf::to_string(&$dvf), $($dv, $dty::to_string(&$dv)),*)
-            }
+            $default_name($($default_ty),*),
+            $($name($($ty),*)),*
         }
 
         impl Distribution {
-            fn iter() -> impl Iterator<Item = (&'static str, Self)> {
+            fn iter_voters() -> impl Iterator<Item = Self> {
                 [
-                    ($dstr, Self::$dname($dvf, $dtyf::to_string(&$dvf), $($dv, $dty::to_string(&$dv)),*)),
-                    $(($str, Self::$name($vf, $tyf::to_string(&$vf), $($v, $ty::to_string(&$v)),*))),*
+                    Self::$default_name($($default_voters),*),
+                    $(Self::$name($($voters),*)),*
                 ]
                     .into_iter()
             }
 
+            fn iter_candidates() -> impl Iterator<Item = Self> {
+                [
+                    Self::$default_name($($default_candidates),*),
+                    $(Self::$name($($candidates),*)),*
+                ]
+                    .into_iter()
+            }
+
+            fn default_voters() -> Self {
+                Self::$default_name($($default_voters),*)
+            }
+
+            fn default_candidates() -> Self {
+                Self::$default_name($($default_candidates),*)
+            }
+
             fn to_str(&self) -> &'static str {
                 match self {
-                    Self::$dname(..) => $dstr,
+                    Self::$default_name(..) => $default_str,
                     $(Self::$name(..) => $str),*
                 }
             }
@@ -327,48 +387,123 @@ macro_rules! define_distribution {
 }
 
 define_distribution! {
-    Beta, "Beta", (f64, f64, f64, f64), (2.0, 32.0, 8.0, 128.0),
-    Uniform, "Uniform", (f64, f64, f64, f64), (1.0, 0.25, 0.75, 0.125)
+    Beta, "Beta", (f64, f64, f64, f64, bool), (2.0, 2.0, 32.0, 32.0, false), (2.0, 2.0, 32.0, 32.0, false),
+    Uniform, "Uniform", (f64, f64), (1.0, 4.0), (1.0, 4.0)
 }
 
-impl Distribution {
+#[derive(Clone, Debug, PartialEq)]
+pub struct DistributionManager {
+    voters: Distribution,
+    candidates: Distribution,
+}
+
+impl Default for DistributionManager {
+    fn default() -> Self {
+        Self {
+            voters: Distribution::default_voters(),
+            candidates: Distribution::default_candidates(),
+        }
+    }
+}
+
+impl DistributionManager {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         ui.heading("Distribution Settings");
 
         egui::Grid::new("Distribution Settings grid").show(ui, |ui| {
-            // Choose distribution type
-            ui.label("Distribution");
-
-            egui::ComboBox::new("distribution_settings", "")
-                .selected_text(self.to_str())
+            ui.label("Voters distribution");
+            egui::ComboBox::new("voters distribution settings", "")
+                .selected_text(self.voters.to_str())
                 .show_ui(ui, |ui| {
-                    for (name, distr) in Self::iter() {
-                        ui.selectable_value(self, distr, name);
+                    for distr in Distribution::iter_voters() {
+                        let name = distr.to_str();
+                        ui.selectable_value(&mut self.voters, distr, name);
                     }
                 });
+
             ui.end_row();
-            match self {
-                Self::Beta(vx, vxs, vy, vys, cx, cxs, cy, cys) => {
-                    for (name, var, var_string) in [
-                        ("Voters (X)", vx, vxs),
-                        ("Voters (Y)", vy, vys),
-                        ("Candidates (X)", cx, cxs),
-                        ("Candidates (Y)", cy, cys),
-                    ] {
+
+            match &mut self.voters {
+                Distribution::Beta(xa, xb, ya, yb, complex) => {
+                    ui.label("Advanced Settings");
+                    ui.checkbox(complex, "");
+
+                    ui.end_row();
+
+                    if *complex {
+                        for (name, value) in [
+                            ("X alpha", xa),
+                            ("X beta", xb),
+                            ("Y alpha", ya),
+                            ("Y beta", yb),
+                        ] {
+                            ui.label(name);
+                            ui.add(egui::DragValue::new(value).range(1.0..=f64::MAX));
+                            ui.end_row();
+                        }
+                    } else {
+                        for (name, a, b) in [("X params", xa, xb), ("Y params", ya, yb)] {
+                            ui.label(name);
+                            ui.add(egui::DragValue::new(a).range(1.0..=f64::MAX));
+                            ui.end_row();
+
+                            *b = *a;
+                        }
+                    }
+                }
+                Distribution::Uniform(x, y) => {
+                    for (name, value) in [("X scale", x), ("Y scale", y)] {
                         ui.label(name);
-                        crate::util::typed_textbox(var, var_string, ui, 1.0, f64::MAX);
+                        ui.add(egui::DragValue::new(value).range(1.0..=f64::MAX));
                         ui.end_row();
                     }
                 }
-                Self::Uniform(vx, vxs, vy, vys, cx, cxs, cy, cys) => {
-                    for (name, var, var_string) in [
-                        ("Voters max distance (X)", vx, vxs),
-                        ("Voters max distance (Y)", vy, vys),
-                        ("Candidates max distance (X)", cx, cxs),
-                        ("Candidates max distance (Y)", cy, cys),
-                    ] {
+            }
+
+            ui.label("Candidates distribution");
+            egui::ComboBox::new("candidates distribution settings", "")
+                .selected_text(self.candidates.to_str())
+                .show_ui(ui, |ui| {
+                    for distr in Distribution::iter_candidates() {
+                        let name = distr.to_str();
+                        ui.selectable_value(&mut self.candidates, distr, name);
+                    }
+                });
+
+            ui.end_row();
+
+            match &mut self.candidates {
+                Distribution::Beta(xa, xb, ya, yb, complex) => {
+                    ui.label("Advanced Settings");
+                    ui.checkbox(complex, "");
+
+                    ui.end_row();
+
+                    if *complex {
+                        for (name, value) in [
+                            ("X alpha", xa),
+                            ("X beta", xb),
+                            ("Y alpha", ya),
+                            ("Y beta", yb),
+                        ] {
+                            ui.label(name);
+                            ui.add(egui::DragValue::new(value).range(1.0..=f64::MAX));
+                            ui.end_row();
+                        }
+                    } else {
+                        for (name, a, b) in [("X params", xa, xb), ("Y params", ya, yb)] {
+                            ui.label(name);
+                            ui.add(egui::DragValue::new(a).range(1.0..=f64::MAX));
+                            ui.end_row();
+
+                            *b = *a;
+                        }
+                    }
+                }
+                Distribution::Uniform(x, y) => {
+                    for (name, value) in [("X scale", x), ("Y scale", y)] {
                         ui.label(name);
-                        crate::util::typed_textbox(var, var_string, ui, 0.0, 1.0);
+                        ui.add(egui::DragValue::new(value).range(1.0..=f64::MAX));
                         ui.end_row();
                     }
                 }
@@ -387,31 +522,34 @@ impl Distribution {
     where
         R: Rng,
     {
-        match self {
-            Self::Beta(vx, _, vy, _, cx, _, cy, _) => {
-                let (vx, vy, cx, cy) = (
-                    Beta::new(*vx, *vx).unwrap(),
-                    Beta::new(*vy, *vy).unwrap(),
-                    Beta::new(*cx, *cx).unwrap(),
-                    Beta::new(*cy, *cy).unwrap(),
-                );
-                (
-                    Box::new(move |rng| vx.sample(rng)),
-                    Box::new(move |rng| vy.sample(rng)),
-                    Box::new(move |rng| cx.sample(rng)),
-                    Box::new(move |rng| cy.sample(rng)),
-                )
-            }
-            Self::Uniform(vx, _, vy, _, cx, _, cy, _) => {
-                let (vx, vy, cx, cy) = (*vx, *vy, *cx, *cy);
-                (
-                    Box::new(move |rng| (RandDistr::<f64>::sample(&Open01, rng) - 0.5) * vx + 0.5),
-                    Box::new(move |rng| (RandDistr::<f64>::sample(&Open01, rng) - 0.5) * vy + 0.5),
-                    Box::new(move |rng| (RandDistr::<f64>::sample(&Open01, rng) - 0.5) * cx + 0.5),
-                    Box::new(move |rng| (RandDistr::<f64>::sample(&Open01, rng) - 0.5) * cy + 0.5),
-                )
+        fn into_functions<R: Rng>(
+            distr: &Distribution,
+        ) -> (Box<dyn Fn(&mut R) -> f64>, Box<dyn Fn(&mut R) -> f64>) {
+            match distr {
+                Distribution::Beta(xa, xb, ya, yb, _) => {
+                    let (x, y) = (Beta::new(*xa, *xb).unwrap(), Beta::new(*ya, *yb).unwrap());
+                    (
+                        Box::new(move |rng| x.sample(rng)),
+                        Box::new(move |rng| y.sample(rng)),
+                    )
+                }
+                Distribution::Uniform(x, y) => {
+                    let (x, y) = (*x, *y);
+                    (
+                        Box::new(move |rng| {
+                            (RandDistr::<f64>::sample(&Open01, rng) - 0.5) / x + 0.5
+                        }),
+                        Box::new(move |rng| {
+                            (RandDistr::<f64>::sample(&Open01, rng) - 0.5) / y + 0.5
+                        }),
+                    )
+                }
             }
         }
+
+        let (vx, vy) = into_functions(&self.voters);
+        let (cx, cy) = into_functions(&self.candidates);
+        (vx, vy, cx, cy)
     }
 }
 
