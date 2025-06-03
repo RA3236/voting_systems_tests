@@ -1,32 +1,48 @@
-use std::{
-    fmt::Display,
-    iter::FusedIterator,
-    simd::{LaneCount, Simd, StdFloat, SupportedLaneCount},
-    str::FromStr,
-};
+use std::simd::{LaneCount, Simd, StdFloat, SupportedLaneCount};
 
-pub fn typed_textbox<T: FromStr + Display + PartialOrd + Copy>(
-    value: &mut T,
-    value_string: &mut String,
-    ui: &mut egui::Ui,
-    min: T,
-    max: T,
-) {
-    let response = ui.add(egui::TextEdit::singleline(value_string));
-    if response.lost_focus() {
-        if let Ok(new) = value_string.parse() {
-            *value = new;
-        }
-        *value = if *value < min {
-            min
-        } else if *value > max {
-            max
-        } else {
-            *value
-        };
-        *value_string = format!("{value}");
-    }
+macro_rules! min_ty {
+    (usize) => {
+        1
+    };
+    (f64) => {
+        0.0
+    };
 }
+
+macro_rules! max_ty {
+    ($ty:ident) => {
+        $ty::MAX
+    };
+}
+pub(crate) use max_ty;
+pub(crate) use min_ty;
+
+macro_rules! drag_value {
+    ($v:expr, $_:ident, min $min:expr, max $max:expr) => {
+        egui::DragValue::new(&mut $v).range($min..=$max)
+    };
+    ($v:expr, $ty:ident, min $min:expr) => {
+        egui::DragValue::new(&mut $v).range($min..=$crate::util::max_ty!($ty))
+    };
+    ($v:expr, $ty:ident, max $max:expr) => {
+        egui::DragValue::new(&mut $v).range($crate::util::min_ty!($ty)..=$max)
+    };
+    ($v:expr, $ty:ident) => {
+        egui::DragValue::new(&mut $v).range($crate::util::min_ty!($ty)..=$crate::util::max_ty!($ty))
+    };
+}
+pub(crate) use drag_value;
+
+macro_rules! input {
+    ($ui:expr, $($n:literal, $v:expr, $ty:ident $(, min $min:expr)? $(, max $max:expr)?),*) => {
+        $(
+            $ui.label($n);
+            $ui.add($crate::util::drag_value!($v, $ty $(, min $min)? $(, max $max)?));
+            $ui.end_row();
+        )*
+    };
+}
+pub(crate) use input;
 
 pub fn create_populace(
     vx: &[f64],
@@ -60,7 +76,6 @@ pub fn create_populace(
                         let (cx, cy) = (Simd::from_array(cx), Simd::from_array(cy));
 
                         ((vx - cx) * (vx - cx) + (vy - cy) * (vy - cy))
-                            .sqrt()
                             .copy_to_slice(&mut array[i * N..])
                     });
                 array
@@ -142,70 +157,4 @@ pub fn create_populace_mut(
     check!(4, "avx");
     check!(2, "sse2");
     check!();
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct RangeFloatIterator {
-    start: f64,
-    end: f64,
-    step_by: f64,
-    is_exclusive: bool,
-    current: f64,
-    finished: bool,
-}
-
-impl Iterator for RangeFloatIterator {
-    type Item = f64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-
-        let tmp = self.current;
-        if tmp >= self.end {
-            self.finished = true;
-            if self.is_exclusive {
-                return None;
-            } else {
-                return Some(self.end);
-            }
-        }
-        self.current = tmp + self.step_by;
-        Some(tmp)
-    }
-}
-
-impl FusedIterator for RangeFloatIterator {}
-
-pub trait RangeFloatIter {
-    fn into_iter_step(self, step: f64) -> RangeFloatIterator;
-}
-
-use std::ops::*;
-
-impl RangeFloatIter for Range<f64> {
-    fn into_iter_step(self, step_by: f64) -> RangeFloatIterator {
-        RangeFloatIterator {
-            start: self.start,
-            end: self.end,
-            step_by,
-            is_exclusive: true,
-            current: self.start,
-            finished: false,
-        }
-    }
-}
-
-impl RangeFloatIter for RangeInclusive<f64> {
-    fn into_iter_step(self, step_by: f64) -> RangeFloatIterator {
-        RangeFloatIterator {
-            start: *self.start(),
-            end: *self.end(),
-            step_by,
-            is_exclusive: true,
-            current: *self.start(),
-            finished: false,
-        }
-    }
 }

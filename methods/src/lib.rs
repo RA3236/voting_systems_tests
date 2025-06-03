@@ -1,56 +1,20 @@
 #![feature(portable_simd)]
 #![feature(array_chunks)]
-#![deny(missing_docs)]
+#![feature(array_windows)]
 
 //! A collection of voting methods.
 
 /// The result type for this crate.
 pub type Result<T> = std::result::Result<T, MethodsError>;
 
-mod anti_plurality;
-mod average;
-mod condorcet;
-mod fptp;
-mod irv;
-mod ranked_pairs;
-mod score;
-
-use anti_plurality::*;
-pub use average::*;
-pub use condorcet::*;
-use fptp::*;
-use irv::*;
-use ranked_pairs::*;
-use score::*;
-
-macro_rules! handle_function {
-    (box ($min:literal, $max:literal, $func:expr)) => {
-        Box::new(score::<T>(
-            $min,
-            $max,
-            std::f64::consts::FRAC_1_SQRT_2,
-            $func,
-        ))
-    };
-    (box $func:expr) => {
-        Box::new($func)
-    };
-    (score_fn $max_dist:ident, ($min:literal, $max:literal, $func:expr)) => {
-        Some(Box::new(score::<T>($min, $max, $max_dist, $func)))
-    };
-    (score_fn $max_dist:ident, $func:expr) => {
-        None
-    };
-    (is_score ($min:literal, $max:literal, $func:expr)) => {
-        true
-    };
-    (is_score $func:expr) => {
-        false
-    };
-}
+pub mod average;
+pub mod condorcet;
+pub mod fptp;
+pub mod irv;
+pub mod ranked_pairs;
 
 macro_rules! define_method {
-    ($($name:ident, $str:literal, $desc:literal, $func:tt);*) => {
+    ($($name:ident, $str:literal, $desc:literal, $func:ident, $cached:ident);*) => {
         /// The methods this crate defines.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum Method {
@@ -80,27 +44,18 @@ macro_rules! define_method {
                 }
             }
 
-            /// Whether this method is a score function.
-            pub fn is_score(&self) -> bool {
-                match self {
-                    $(Self::$name => handle_function!(is_score $func)),*
-                }
-            }
-
-
             /// For non-score methods, their method function.
             ///
             /// Each function takes in a `&`[`PopulaceMethod`]`<T>` and outputs a `Result<T>`.
             pub fn func<T: 'static>(&self) -> MethodFn<T> {
                 match self {
-                    $(Self::$name => handle_function!(box $func)),*
+                    $(Self::$name => Box::new($func::$func)),*
                 }
             }
 
-            /// For score methods, constructs the method function given a maximum distance.
-            pub fn score_fn<T: 'static>(&self, max_dist: f64) -> Option<MethodFn<T>> {
+            pub fn cached(&self, populace: Vec<Vec<f64>>, num_voters: usize, num_candidates: usize) -> Result<Box<dyn CachedMethod + Send>> {
                 match self {
-                    $(Self::$name => handle_function!(score_fn max_dist, $func)),*
+                    $(Self::$name => $func::$cached::new(populace, num_voters, num_candidates)),*
                 }
             }
         }
@@ -111,14 +66,9 @@ macro_rules! define_method {
 pub type MethodFn<T> = Box<dyn Fn(&dyn PopulaceMethod<T>) -> Result<T> + Send + Sync>;
 
 define_method! {
-    FirstPastThePost, "First Past the Post", "Vote once for closest; candidate with the most votes wins", fptp;
-    InstantRunoff, "Instant Runoff", "Rank candidates; eliminate least-votes then distribute preferences until one remains", irv;
-    RankedPairs, "Ranked Pairs", "Rank candidates; sort preference margins, eliminate cycles, find Condorcet winner", ranked_pairs;
-    AntiPlurality, "Anti-Plurality", "Vote once for furthest; candidate with the least votes wins", anti_plurality
-    // Approval, "Approval", "Vote for closest few; candidate with the most votes wins", (0, 1, single_round);
-    // Score, "Score", "Score candidates; candidate with the highest score wins", (0, 10, single_round);
-    // Star, "STAR", "Score candidates; find highest two scores, then FPTP runoff between those two candidates", (0, 5, two_round);
-    // StarD, "STAR doubled", "STAR with double maximum score (same as Score, but with runoff)", (0, 10, two_round)
+    FirstPastThePost, "First Past the Post", "Vote once for closest; candidate with the most votes wins", fptp, FptpCached;
+    InstantRunoff, "Instant Runoff", "Rank candidates; eliminate least-votes then distribute preferences until one remains", irv, IrvCached;
+    RankedPairs, "Ranked Pairs", "Rank candidates; sort preference margins, eliminate cycles, find Condorcet winner", ranked_pairs, RankedPairsCached
 }
 
 impl Default for Method {
@@ -201,4 +151,20 @@ pub trait PopulaceMethod<T> {
             })
             .collect::<Result<()>>()
     }
+}
+
+pub trait CachedMethod {
+    fn new(
+        initial_populace: Vec<Vec<f64>>,
+        num_voters: usize,
+        num_candidates: usize,
+    ) -> Result<Box<dyn CachedMethod + Send>>
+    where
+        Self: Sized;
+
+    fn get_current_result(&mut self) -> Result<usize>;
+
+    fn mock_score_candidate(&mut self, candidate: usize, distances: &[f64]) -> Result<isize>;
+
+    fn update_candidate(&mut self, candidate: usize, new_distances: &[f64]) -> Result<()>;
 }

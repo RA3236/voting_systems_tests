@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use charming::{
     Chart, ImageRenderer,
     component::{Axis, Title, VisualMap, VisualMapChannel},

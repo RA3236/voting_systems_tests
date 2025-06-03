@@ -5,14 +5,13 @@
 use std::{
     ops::Deref,
     sync::OnceLock,
-    time::{Duration, Instant},
 };
 
-use charming::{Chart, ImageRenderer};
+use chrono::{prelude::*, TimeDelta};
+
 use eframe::NativeOptions;
-use egui::{Context, Rect, Ui};
+use egui::{Context, Rect};
 use internment::ArcIntern;
-use rayon::Yield;
 use runtime_settings::AppRuntimeSettings;
 use rustc_hash::FxHashMap;
 
@@ -44,6 +43,12 @@ pub type MessageReceiver = std::sync::mpsc::Receiver<Message>;
 
 pub static CONTEXT: OnceLock<Context> = OnceLock::new();
 
+pub struct Progress {
+    current: usize,
+    total: usize,
+    start: DateTime<Utc>,
+}
+
 struct EguiApp {
     runtime_settings: AppRuntimeSettings,
 
@@ -52,14 +57,15 @@ struct EguiApp {
     sender: MessageSender,
     receiver: MessageReceiver,
 
+    progress: FxHashMap<ArcIntern<str>, Progress>,
+
     prev_rect: Rect,
-    dur: Option<Instant>,
+    dur: Option<DateTime<Utc>>,
 }
 
 impl EguiApp {
     fn new() -> Self {
         let (egui_sender, egui_receiver) = std::sync::mpsc::channel();
-        let def: ArcIntern<str> = ArcIntern::from("");
         Self {
             runtime_settings: AppRuntimeSettings::default(),
 
@@ -67,6 +73,8 @@ impl EguiApp {
 
             sender: egui_sender,
             receiver: egui_receiver,
+
+            progress: FxHashMap::default(),
 
             prev_rect: Rect::EVERYTHING,
             dur: None,
@@ -88,21 +96,42 @@ impl eframe::App for EguiApp {
 
         for msg in self.receiver.try_iter() {
             match msg {
-                msg if self.images.process_msg(&msg) => {},
+                msg if self.images.process_msg(&msg) => {}
                 Message::DropImages => {
                     self.images = ImageStore::default();
                     ctx.forget_all_images();
-                },
+                    self.progress.clear();
+                }
                 Message::SimulationFinished => {
                     self.runtime_settings.unlock();
-                },
+                }
+                Message::IncrementProgress(key) => {
+                    self.progress
+                        .entry(key)
+                        .and_modify(|v| v.current += 1)
+                        .or_insert_with(|| Progress {
+                            current: 1,
+                            total: 0,
+                            start: Utc::now(),
+                        });
+                }
+                Message::TotalProgress(key, total) => {
+                    self.progress
+                        .entry(key)
+                        .and_modify(|v| v.total = total)
+                        .or_insert_with(|| Progress {
+                            current: 0,
+                            total,
+                            start: Utc::now(),
+                        });
+                }
                 _ => {} // We don't care about anything else
             }
         }
 
         ctx.input(|i| {
             if i.screen_rect() != self.prev_rect {
-                self.dur = Some(Instant::now());
+                self.dur = Some(Utc::now());
                 self.prev_rect = i.screen_rect;
             }
         });
@@ -114,7 +143,7 @@ impl eframe::App for EguiApp {
         if self
             .dur
             .as_ref()
-            .map(|i| i.elapsed() > Duration::from_secs(1))
+            .map(|i| Utc::now() - *i > TimeDelta::seconds(1))
             .unwrap_or(false)
         {
             self.dur.take();
@@ -134,17 +163,31 @@ impl eframe::App for EguiApp {
             ui.add_enabled_ui(!self.runtime_settings.locked(), |ui| {
                 if self.runtime_settings.locked() {
                     ui.vertical(|ui| {
-                        for (name, progress) in self.runtime_settings.progress() {
-                            ui.heading(name);
+                        for (name, progress) in &self.progress {
+                            let start = progress.start;
+                            let progress = progress.current as f64 / progress.total as f64;
+                            let elapsed = Utc::now() - start;
+                            let res = elapsed * ((1.0 - progress) / progress * 100000.0) as i32 / 100000;
+                            let formatted = if res.num_minutes() > 0 {
+                                format!("{}m {}s", res.num_minutes(), res.num_seconds() % 60)
+                            } else {
+                                format!("{}s", res.num_seconds())
+                            };
+                            if progress < 1.0 {
+                                ui.heading(format!("{name} ({formatted})"));
+                            } else {
+                                ui.heading(name.deref());
+                            }
                             ui.add(
                                 egui::ProgressBar::new(progress as f32)
                                     .show_percentage()
                                     .animate(true),
                             );
-                            ui.centered_and_justified(|ui| {
-                                ui.label("Images may take a second to load...");
-                            });
                         }
+
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Images may take a second to load...");
+                        });
                     });
                 } else if self.images.categories.is_empty() {
                     ui.centered_and_justified(|ui| {
@@ -160,13 +203,17 @@ impl eframe::App for EguiApp {
                         .min_col_width(widget_width)
                         .max_col_width(widget_width)
                         .show(ui, |ui| {
-                            ui.label("text");
+                            ui.label("Select category");
                             egui::ComboBox::new("category_box", "")
                                 .selected_text(self.images.current_category.deref())
                                 .width(widget_width)
                                 .show_ui(ui, |ui| {
                                     for category in self.images.categories.keys() {
-                                        ui.selectable_value(&mut self.images.current_category, category.clone(), category.deref());
+                                        ui.selectable_value(
+                                            &mut self.images.current_category,
+                                            category.clone(),
+                                            category.deref(),
+                                        );
                                     }
                                 });
                             ui.end_row();
@@ -183,11 +230,15 @@ impl eframe::App for EguiApp {
                                         .width(widget_width)
                                         .show_ui(ui, |ui| {
                                             for name in data.keys() {
-                                                ui.selectable_value(&mut self.images.current_name, name.clone(), name.deref());
+                                                ui.selectable_value(
+                                                    &mut self.images.current_name,
+                                                    name.clone(),
+                                                    name.deref(),
+                                                );
                                             }
                                         });
                                     uri = data[&self.images.current_name].clone();
-                                },
+                                }
                                 Category::SeatProjection { first_key, data } => {
                                     if !data.contains_key(&self.images.current_ty) {
                                         self.images.current_ty = first_key.clone();
@@ -199,13 +250,19 @@ impl eframe::App for EguiApp {
                                         .width(widget_width)
                                         .show_ui(ui, |ui| {
                                             for ty in data.keys() {
-                                                ui.selectable_value(&mut self.images.current_ty, ty.clone(), ty.deref());
+                                                ui.selectable_value(
+                                                    &mut self.images.current_ty,
+                                                    ty.clone(),
+                                                    ty.deref(),
+                                                );
                                             }
                                         });
                                     ui.end_row();
 
                                     match &data[&self.images.current_ty] {
-                                        SeatProjectionImage::Single(new_uri) => uri = new_uri.clone(),
+                                        SeatProjectionImage::Single(new_uri) => {
+                                            uri = new_uri.clone()
+                                        }
                                         SeatProjectionImage::Multiple { first_key, data } => {
                                             if !data.contains_key(&self.images.current_name) {
                                                 self.images.current_name = first_key.clone();
@@ -219,7 +276,11 @@ impl eframe::App for EguiApp {
                                                     let mut keys = data.keys().collect::<Vec<_>>();
                                                     keys.sort();
                                                     for name in keys {
-                                                        ui.selectable_value(&mut self.images.current_name, name.clone(), name.deref());
+                                                        ui.selectable_value(
+                                                            &mut self.images.current_name,
+                                                            name.clone(),
+                                                            name.deref(),
+                                                        );
                                                     }
                                                 });
                                             uri = data[&self.images.current_name].clone();
@@ -228,72 +289,12 @@ impl eframe::App for EguiApp {
                                 }
                             }
                         });
-                    
+
                     if !uri.is_empty() {
                         ui.add(egui::Image::new(uri.deref()).shrink_to_fit());
                     }
                 }
             });
-
-            // let ImageStore { images, keys } = &self.images;
-            // if keys.is_empty() {
-            //     ui.centered_and_justified(|ui| {
-            //         ui.label("Waiting for images...");
-            //     });
-            // } else if keys.len() == 1 {
-            //     let images = &images[&keys[0]];
-            //     two_wide_buttons(
-            //         ui,
-            //         "Previous Image",
-            //         "Next Image",
-            //         images.len(),
-            //         &mut self.current_image,
-            //     );
-
-            //     let image = &images[self.current_image];
-            //     ui.add(egui::Image::new(image.deref()).shrink_to_fit());
-            // } else {
-            //     ui.vertical_centered_justified(|ui| {
-            //         let available_space = ui.available_width();
-            //         let spacing = ui.style().spacing.item_spacing.x;
-            //         let widget_width = (available_space - spacing) / 2.0;
-
-            //         egui::Grid::new(format!("group selector grid"))
-            //             .min_col_width(widget_width)
-            //             .max_col_width(widget_width)
-            //             .show(ui, |ui| {
-            //                 ui.vertical_centered_justified(|ui| {
-            //                     ui.heading(keys[self.current_group].deref());
-            //                 });
-            //                 ui.vertical_centered_justified(|ui| {
-            //                     egui::ComboBox::new("group select", "")
-            //                         .selected_text("Select image group")
-            //                         .width(widget_width)
-            //                         .show_ui(ui, |ui| {
-            //                             for (i, key) in keys.iter().enumerate() {
-            //                                 ui.selectable_value(
-            //                                     &mut self.current_group,
-            //                                     i,
-            //                                     key.deref(),
-            //                                 );
-            //                             }
-            //                         });
-            //                 });
-            //             });
-            //     });
-
-            //     let images = &images[&keys[self.current_group]];
-            //     two_wide_buttons(
-            //         ui,
-            //         "Previous Image",
-            //         "Next Image",
-            //         images.len(),
-            //         &mut self.current_image,
-            //     );
-
-            //     let image = &images[self.current_image];
-            //     ui.add(egui::Image::new(image.deref()).shrink_to_fit());
-            // }
         });
     }
 }
@@ -302,9 +303,16 @@ pub enum Message {
     // If there are multiple images then we cycle through them
     ImageStandard(ArcIntern<str>, ArcIntern<str>, ArcIntern<str>),
     ImageSeatProjectionSingle(ArcIntern<str>, ArcIntern<str>, ArcIntern<str>),
-    ImageSeatProjectionMultiple(ArcIntern<str>, ArcIntern<str>, ArcIntern<str>, ArcIntern<str>),
+    ImageSeatProjectionMultiple(
+        ArcIntern<str>,
+        ArcIntern<str>,
+        ArcIntern<str>,
+        ArcIntern<str>,
+    ),
     DropImages,
     SimulationFinished,
+    TotalProgress(ArcIntern<str>, usize),
+    IncrementProgress(ArcIntern<str>),
     AppShutdown,
 }
 
@@ -316,8 +324,8 @@ enum Category {
     },
     SeatProjection {
         first_key: ArcIntern<str>,
-        data: FxHashMap<ArcIntern<str>, SeatProjectionImage>
-    }
+        data: FxHashMap<ArcIntern<str>, SeatProjectionImage>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -325,8 +333,8 @@ enum SeatProjectionImage {
     Single(ArcIntern<str>),
     Multiple {
         first_key: ArcIntern<str>,
-        data: FxHashMap<ArcIntern<str>, ArcIntern<str>>
-    }
+        data: FxHashMap<ArcIntern<str>, ArcIntern<str>>,
+    },
 }
 
 #[derive(Default)]
@@ -344,22 +352,21 @@ impl ImageStore {
             Message::ImageStandard(category, name, uri) => {
                 self.categories
                     .entry(category.clone())
-                    .and_modify(|category| {
-                        match category {
-                            Category::Standard { data, .. } => {
-                                data.insert(name.clone(), uri.clone());
-                            },
-                            Category::SeatProjection { .. } => panic!("incorrect category")
+                    .and_modify(|category| match category {
+                        Category::Standard { data, .. } => {
+                            data.insert(name.clone(), uri.clone());
                         }
+                        Category::SeatProjection { .. } => panic!("incorrect category"),
                     })
-                    .or_insert_with(|| {
-                        Category::Standard { data: {
+                    .or_insert_with(|| Category::Standard {
+                        data: {
                             let mut map = FxHashMap::default();
                             map.insert(name.clone(), uri.clone());
                             map
-                        }, first_key: name.clone() }
+                        },
+                        first_key: name.clone(),
                     });
-                
+
                 if self.current_category.is_empty() {
                     self.current_category = category.clone();
                 }
@@ -368,29 +375,30 @@ impl ImageStore {
                 }
 
                 true
-            },
+            }
             Message::ImageSeatProjectionSingle(category, name, uri) => {
                 self.categories
                     .entry(category.clone())
-                    .and_modify(|category| {
-                        match category {
-                            Category::Standard { .. } => panic!("incorrect category"),
-                            Category::SeatProjection { data, .. } => {
-                                data.entry(name.clone())
-                                    .and_modify(|_| panic!("entry already exists!"))
-                                    .or_insert_with(|| SeatProjectionImage::Single(uri.clone()));
-                            }
+                    .and_modify(|category| match category {
+                        Category::Standard { .. } => panic!("incorrect category"),
+                        Category::SeatProjection { data, .. } => {
+                            data.entry(name.clone())
+                                .and_modify(|_| panic!("entry already exists!"))
+                                .or_insert_with(|| SeatProjectionImage::Single(uri.clone()));
                         }
                     })
                     .or_insert_with(|| {
                         self.current_category = category.clone();
-                        Category::SeatProjection { data: {
-                            let mut map = FxHashMap::default();
-                            map.insert(name.clone(), SeatProjectionImage::Single(uri.clone()));
-                            map
-                        }, first_key: name.clone(), }
+                        Category::SeatProjection {
+                            data: {
+                                let mut map = FxHashMap::default();
+                                map.insert(name.clone(), SeatProjectionImage::Single(uri.clone()));
+                                map
+                            },
+                            first_key: name.clone(),
+                        }
                     });
-                
+
                 if self.current_category.is_empty() {
                     self.current_category = category.clone();
                 }
@@ -399,42 +407,44 @@ impl ImageStore {
                 }
 
                 true
-            },
+            }
             Message::ImageSeatProjectionMultiple(category, ty, name, uri) => {
-                let create = || SeatProjectionImage::Multiple { data: {
-                    let mut map = FxHashMap::default();
-                    map.insert(name.clone(), uri.clone());
-                    map
-                }, first_key: name.clone() };
+                let create = || SeatProjectionImage::Multiple {
+                    data: {
+                        let mut map = FxHashMap::default();
+                        map.insert(name.clone(), uri.clone());
+                        map
+                    },
+                    first_key: name.clone(),
+                };
                 self.categories
                     .entry(category.clone())
-                    .and_modify(|category| {
-                        match category {
-                            Category::Standard { .. } => panic!("incorrect category"),
-                            Category::SeatProjection { data, .. } => {
-                                data.entry(ty.clone())
-                                    .and_modify(|v| {
-                                        match v {
-                                            SeatProjectionImage::Single(..) => panic!("incorrect category!"),
-                                            SeatProjectionImage::Multiple { data, .. } => {
-                                                data.entry(name.clone())
-                                                    .and_modify(|_| panic!("entry already exists!"))
-                                                    .or_insert_with(|| uri.clone());
-                                            }
-                                        }
-                                    })
-                                    .or_insert_with(create);
-                            }
+                    .and_modify(|category| match category {
+                        Category::Standard { .. } => panic!("incorrect category"),
+                        Category::SeatProjection { data, .. } => {
+                            data.entry(ty.clone())
+                                .and_modify(|v| match v {
+                                    SeatProjectionImage::Single(..) => {
+                                        panic!("incorrect category!")
+                                    }
+                                    SeatProjectionImage::Multiple { data, .. } => {
+                                        data.entry(name.clone())
+                                            .and_modify(|_| panic!("entry already exists!"))
+                                            .or_insert_with(|| uri.clone());
+                                    }
+                                })
+                                .or_insert_with(create);
                         }
                     })
-                    .or_insert_with(|| {
-                        Category::SeatProjection { data: {
+                    .or_insert_with(|| Category::SeatProjection {
+                        data: {
                             let mut map = FxHashMap::default();
                             map.insert(name.clone(), SeatProjectionImage::Single(uri.clone()));
                             map
-                        }, first_key: name.clone() }
+                        },
+                        first_key: name.clone(),
                     });
-                
+
                 if self.current_category.is_empty() {
                     self.current_category = category.clone();
                 }
@@ -447,35 +457,7 @@ impl ImageStore {
 
                 true
             }
-            _ => false
+            _ => false,
         }
     }
-}
-
-fn two_wide_buttons(ui: &mut Ui, prev: &str, next: &str, len: usize, val: &mut usize) {
-    ui.vertical_centered_justified(|ui| {
-        let available_space = ui.available_width();
-        let spacing = ui.style().spacing.item_spacing.x;
-        let button_width = (available_space - spacing) / 2.0;
-
-        egui::Grid::new(format!("{prev} {next} grid"))
-            .min_col_width(button_width)
-            .max_col_width(button_width)
-            .show(ui, |ui| {
-                ui.vertical_centered_justified(|ui| {
-                    if ui.button(prev).clicked() {
-                        if *val == 0 {
-                            *val = len - 1;
-                        } else {
-                            *val -= 1;
-                        }
-                    }
-                });
-                ui.vertical_centered_justified(|ui| {
-                    if ui.button(next).clicked() {
-                        *val = (*val + 1) % len;
-                    }
-                });
-            });
-    });
 }

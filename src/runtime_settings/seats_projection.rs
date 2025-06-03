@@ -1,13 +1,8 @@
-use std::{
-    process::exit,
-    sync::{Arc, atomic::AtomicUsize},
-    time::{Duration, Instant},
-    usize,
-};
+use std::time::{Duration, Instant};
 
 use charming::{
     Chart, ImageRenderer,
-    component::{Axis, Grid, Legend, Title, VisualMap},
+    component::{Axis, Grid, Legend, Title},
     datatype::{DataPoint, DataPointItem},
     element::{
         AxisType, Color, ItemStyle, Label, LineStyle, MarkLine, MarkLineData, MarkLineVariant,
@@ -16,18 +11,14 @@ use charming::{
     series::{Bar, Scatter},
 };
 use egui::{Align, Color32, FontSelection, Layout, RichText, UiBuilder, text::LayoutJob};
-use indicatif::{ParallelProgressIterator, ProgressStyle};
 use internment::ArcIntern;
-use itertools::Itertools;
 use kiddo::SquaredEuclidean;
-use methods::{Method, MethodFn, PopulaceMethod, VectorMethod};
+use methods::{Method, PopulaceMethod};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-use rayon::iter::{IntoParallelIterator, ParallelExtend, ParallelIterator};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rustc_hash::FxHashSet;
 
-use crate::{Message, runtime_settings::common::WinnerType};
-
-use super::ScoreHandle;
+use crate::{Message, util::input};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SeatsProjectionSettings {
@@ -58,11 +49,7 @@ impl Default for SeatsProjectionSettings {
 }
 
 impl SeatsProjectionSettings {
-    pub fn show(
-        &mut self,
-        available_methods: &FxHashMap<Method, Vec<ScoreHandle>>,
-        ui: &mut egui::Ui,
-    ) {
+    pub fn show(&mut self, available_methods: &FxHashSet<Method>, ui: &mut egui::Ui) {
         ui.heading("Seat Projection Settings");
 
         ui.label("Simulate elections and collect seat data");
@@ -74,47 +61,31 @@ impl SeatsProjectionSettings {
         );
 
         egui::Grid::new("Seat Projection grid").show(ui, |ui| {
-            for (name, value) in [
-                (
-                    "Number of voters per seat",
-                    &mut self.num_voters
-                ),
-                (
-                    "Number of parties",
-                    &mut self.num_parties
-                ),
-                (
-                    "Number of seats",
-                    &mut self.num_seats
-                ),
-                (
-                    "Number of iterations",
-                    &mut self.num_iterations
-                )
-            ] {
-                ui.label(name);
-                //crate::util::typed_textbox(value, value_string, ui, 1, usize::MAX);
-                ui.add(
-                    egui::DragValue::new(value)
-                        .range(1..=usize::MAX)
-                );
-                ui.end_row();
-            }
+            input!(ui,
+                "Number of voters per seat", self.num_voters, usize,
+                "Number of parties", self.num_parties, usize,
+                "Number of seats", self.num_seats, usize,
+                "NUmber of iterations", self.num_iterations, usize
+            );
+            // input!("Number of voters per seat", self.num_voters, ui, 1, usize::MAX);
+            // input!("Number of parties", self.num_parties, ui, 1, usize::MAX);
+            // input!("Number of seats", self.num_seats, ui, 1, usize::MAX);
+            // input!("Number of iterations", self.num_iterations, ui, 1, usize::MAX);
 
             ui.vertical(|ui| {
                 ui.label("Method to watch");
                 ui.small("When simulating, if this method results in a change in potential governing coalitions compared to proportional voting, then those differences will be shown");
             });
             ui.add_enabled_ui(!available_methods.is_empty(), |ui| {
-                if !available_methods.contains_key(&self.watch_method) {
+                if !available_methods.contains(&self.watch_method) {
                     if available_methods.len() > 0 {
-                        self.watch_method = available_methods.keys().copied().next().unwrap();
+                        self.watch_method = available_methods.iter().copied().next().unwrap();
                     }
                 }
                 egui::ComboBox::new("watch method", "")
                     .selected_text(self.watch_method.name())
                     .show_ui(ui, |ui| {
-                        for method in available_methods.keys().copied() {
+                        for method in available_methods.iter().copied() {
                             let name = method.name();
                             ui.selectable_value(&mut self.watch_method, method, name);
                         }
@@ -163,14 +134,8 @@ impl SeatsProjectionSettings {
     pub fn simulate(
         &self,
         sender: &std::sync::mpsc::Sender<crate::Message>,
-        methods: &std::collections::HashMap<
-            methods::Method,
-            Vec<super::ScoreHandle>,
-            rustc_hash::FxBuildHasher,
-        >,
+        methods: &FxHashSet<Method>,
         distrs: &super::DistributionManager,
-        progress: Arc<AtomicUsize>,
-        total: Arc<AtomicUsize>,
     ) {
         let sender = sender.clone();
         let methods = methods.clone();
@@ -186,27 +151,17 @@ impl SeatsProjectionSettings {
         let max_offset = self.max_offset;
         let _save_to_file = self.save_winner_types_to_file;
 
-        total.store(num_iterations, std::sync::atomic::Ordering::SeqCst);
+        let name: ArcIntern<str> = ArcIntern::from("Seat Projections");
+        sender
+            .send(Message::TotalProgress(name.clone(), num_iterations))
+            .unwrap();
         rayon::spawn(move || {
             // Get method names and functions
             let (mut method_names, methods) = methods
                 .into_iter()
-                .flat_map(|(method, score_values)| {
-                    score_values.into_iter().map(move |v| {
-                        (
-                            match method.is_score() {
-                                true => format!("{} ({v})", method.name()),
-                                false => method.name().to_string(),
-                            },
-                            match v {
-                                ScoreHandle::Full => method.func() as MethodFn<usize>,
-                                ScoreHandle::Custom(v, _) => method.score_fn(v).unwrap(),
-                            },
-                        )
-                    })
-                })
+                .map(|method| (method.name(), method.func()))
                 .collect::<(Vec<_>, Vec<_>)>();
-            method_names.push("Proportional".to_string());
+            method_names.push("Proportional");
 
             // Sender/reciever for first iteration
             let (results_sender, results_receiver) =
@@ -215,7 +170,7 @@ impl SeatsProjectionSettings {
             // Determine method index of watched method
             let mut watch_method_index = 0;
             for i in 0..method_names.len() {
-                if &method_names[i] == watch_method.name() {
+                if method_names[i] == watch_method.name() {
                     watch_method_index = i;
                     break;
                 }
@@ -234,12 +189,6 @@ impl SeatsProjectionSettings {
             // Perform all iterations
             let iteration_results = (0..num_iterations)
                 .into_par_iter()
-                .progress_with_style(
-                    ProgressStyle::with_template(
-                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
-                    )
-                    .unwrap(),
-                )
                 .map_with(
                     (
                         // Main Results
@@ -251,182 +200,173 @@ impl SeatsProjectionSettings {
                         // Sainte-Lague Allocated seats
                         vec![0i64; num_parties],
                     ),
-                    |
-                        (
-                            main_results,
-                            proportional_votes,
-                            main_results_data,
-                            allocated_seats,
-                        ),
-                        iter
-                    |{
+                    |(main_results, proportional_votes, main_results_data, allocated_seats),
+                     iter| {
+                        // We need to calculate multiple things here:
+                        // 1. The average voter for each round
+                        // 2. The Condorcet winner for each round
+                        // 3. The seat winner for each method
+                        // Note that unlike the usual simulations, the average voter is different every seat
+                        // We store the results in three different
+                        let main_data = main_data.get_iter_data(iter);
 
-                    // We need to calculate multiple things here:
-                    // 1. The average voter for each round
-                    // 2. The Condorcet winner for each round
-                    // 3. The seat winner for each method
-                    // Note that unlike the usual simulations, the average voter is different every seat
-                    // We store the results in three different
-                    let main_data = main_data.get_iter_data(iter);
+                        // Collect results
+                        (0..num_seats)
+                            .into_iter()
+                            .map(|seat_num| {
+                                // Get the populace
+                                let populace = main_data.get_populace(seat_num);
 
-                    // Collect results
-                    (0..num_seats)
-                        .into_iter()
-                        .map(|seat_num| {
-                            // Get the populace
-                            let populace = main_data.get_populace(seat_num);
+                                // Calculate per-method results, compare with condorcet to get winner type as well
+                                let main_results = methods
+                                    .iter()
+                                    .map(|func| func(&populace).unwrap())
+                                    .collect::<Vec<_>>();
 
-                            // Calculate per-method results, compare with condorcet to get winner type as well
-                            let main_results = methods
-                                .iter()
-                                .map(|func| {
-                                    func(&populace).unwrap()
+                                (seat_num, main_results)
+                            })
+                            .for_each(|(seat_num, main)| {
+                                main_results[seat_num] = main;
+                            });
+
+                        // Show the seat counts for each of the methods
+                        // First calculate using party lists to compare with proportional
+                        proportional_votes.fill(0);
+                        (0..num_seats).into_iter().for_each(|i| {
+                            let populace = main_data.get_populace(i);
+                            populace
+                                .iter_populace(&mut |voter: &[f64]| {
+                                    proportional_votes[voter
+                                        .into_iter()
+                                        .enumerate()
+                                        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                                        .map(|(i, _)| i)
+                                        .unwrap()] += 1;
                                 })
-                                .collect::<Vec<_>>();
-
-                            (
-                                seat_num,
-                                main_results,
-                            )
-                        })
-                        .for_each(|(seat_num, main)| {
-                            main_results[seat_num] = main;
+                                .unwrap();
                         });
 
-                    // Show the seat counts for each of the methods
-                    // First calculate using party lists to compare with proportional
-                    proportional_votes.fill(0);
-                    (0..num_seats).into_iter().for_each(|i| {
-                        let populace = main_data.get_populace(i);
-                        populace
-                            .iter_populace(&mut |voter: &[f64]| {
-                                proportional_votes[voter
-                                    .into_iter()
-                                    .enumerate()
-                                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                                    .map(|(i, _)| i)
-                                    .unwrap()] += 1;
-                            })
-                            .unwrap();
-                    });
-
-                    // Now we calculate the number of seats each party got for each method
-                    // Result data is currently in form [seat][method] -> party
-                    // We need it in the form [party][method] -> seat_count
-                    for party in 0..num_parties {
-                        main_results_data[party].fill(0i64);
-                    }
-                    for seat in 0..num_seats {
-                        for method in 0..len_wo_prop {
-                            let party = main_results[seat][method];
-                            main_results_data[party][method] += 1;
+                        // Now we calculate the number of seats each party got for each method
+                        // Result data is currently in form [seat][method] -> party
+                        // We need it in the form [party][method] -> seat_count
+                        for party in 0..num_parties {
+                            main_results_data[party].fill(0i64);
                         }
-                    }
+                        for seat in 0..num_seats {
+                            for method in 0..len_wo_prop {
+                                let party = main_results[seat][method];
+                                main_results_data[party][method] += 1;
+                            }
+                        }
 
-                    // Sainte-Lague method for PLPR
-                    allocated_seats.fill(0i64);
-                    for _ in 0..num_seats {
-                        // Calculate quotients
-                        let winner = proportional_votes
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .map(|(i, v)| (i, v as i64 / (2 * allocated_seats[i] + 1)))
-                            .max_by(|(_, a), (_, b)| a.cmp(b))
-                            .map(|(i, _)| i)
-                            .unwrap();
-                        allocated_seats[winner] += 1;
-                    }
-                    // Splat into method results
-                    for party in 0..num_parties {
-                        main_results_data[party][len_wo_prop] += allocated_seats[party];
-                    }
+                        // Sainte-Lague method for PLPR
+                        allocated_seats.fill(0i64);
+                        for _ in 0..num_seats {
+                            // Calculate quotients
+                            let winner = proportional_votes
+                                .iter()
+                                .copied()
+                                .enumerate()
+                                .map(|(i, v)| (i, v as i64 / (2 * allocated_seats[i] + 1)))
+                                .max_by(|(_, a), (_, b)| a.cmp(b))
+                                .map(|(i, _)| i)
+                                .unwrap();
+                            allocated_seats[winner] += 1;
+                        }
+                        // Splat into method results
+                        for party in 0..num_parties {
+                            main_results_data[party][len_wo_prop] += allocated_seats[party];
+                        }
 
-                    // Go through every combination of party, and determine if the result for the
-                    // watch method is different to proportional
-                    let mut different = vec![false; len_wo_prop];
-                    let mut sent = false;
-                    let parties = (0..num_parties)
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    for length in 1..num_parties {
-                        let diff = parties
-                            .windows(length)
-                            .filter_map(|parties| {
-                                // Get proportional count
-                                let prop: i64 = parties
-                                    .iter()
-                                    .copied()
-                                    .map(|i| {
-                                        main_results_data[i][len_wo_prop]
-                                    })
-                                    .sum();
-                                // Get the counts for each method
-                                if (0..methods_len)
-                                    .into_iter()
-                                    .map(|method| {
-                                        parties
-                                            .iter()
-                                            .copied()
-                                            .map(|party| {
-                                                main_results_data[party][method]
-                                            })
-                                            .sum::<i64>()
-                                    })
-                                    .enumerate()
-                                    .any(|(i, method)| {
-                                        let winning_count = num_seats as i64 / 2 + 1;
-                                        let matched = prop >= winning_count && method < winning_count || prop < winning_count && method >= winning_count;
-                                        if matched {
-                                            different[i] = true;
-                                            if i == watch_method_index {
-                                                true
+                        // Go through every combination of party, and determine if the result for the
+                        // watch method is different to proportional
+                        let mut different = vec![false; len_wo_prop];
+                        let mut sent = false;
+                        let parties = (0..num_parties).into_iter().collect::<Vec<_>>();
+                        for length in 1..num_parties {
+                            let diff = parties
+                                .windows(length)
+                                .filter_map(|parties| {
+                                    // Get proportional count
+                                    let prop: i64 = parties
+                                        .iter()
+                                        .copied()
+                                        .map(|i| main_results_data[i][len_wo_prop])
+                                        .sum();
+                                    // Get the counts for each method
+                                    if (0..methods_len)
+                                        .into_iter()
+                                        .map(|method| {
+                                            parties
+                                                .iter()
+                                                .copied()
+                                                .map(|party| main_results_data[party][method])
+                                                .sum::<i64>()
+                                        })
+                                        .enumerate()
+                                        .any(|(i, method)| {
+                                            let winning_count = num_seats as i64 / 2 + 1;
+                                            let matched = prop >= winning_count
+                                                && method < winning_count
+                                                || prop < winning_count && method >= winning_count;
+                                            if matched {
+                                                different[i] = true;
+                                                if i == watch_method_index { true } else { false }
                                             } else {
                                                 false
                                             }
-                                        } else {
-                                            false
-                                        }
-                                    }) {
+                                        })
+                                    {
                                         Some(parties)
                                     } else {
                                         None
                                     }
-                            })
-                            .next();
-                        if !sent {
-                            if let Some(parties) = diff {
-                                let (cx, cy) = main_data.get_candidates();
-                                let party_positions = (0..num_parties)
-                                    .into_iter()
-                                    .map(|i| vec![cx[i], cy[i]])
-                                    .collect();
-                                results_sender.send((
-                                    iter,
-                                    parties.to_vec(),
-                                    main_results_data.clone(),
-                                    party_positions
-                                )).unwrap();
-                                sent = true;
+                                })
+                                .next();
+                            if !sent {
+                                if let Some(parties) = diff {
+                                    let (cx, cy) = main_data.get_candidates();
+                                    let party_positions = (0..num_parties)
+                                        .into_iter()
+                                        .map(|i| vec![cx[i], cy[i]])
+                                        .collect();
+                                    results_sender
+                                        .send((
+                                            iter,
+                                            parties.to_vec(),
+                                            main_results_data.clone(),
+                                            party_positions,
+                                        ))
+                                        .unwrap();
+                                    sent = true;
+                                }
                             }
                         }
-                    }
-                    progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        sender
+                            .send(Message::IncrementProgress(name.clone()))
+                            .unwrap();
 
-                    different
-                })
-                .fold(|| vec![0i64; len_wo_prop], |mut accum, diff| {
-                    for i in 0..len_wo_prop {
-                        accum[i] += diff[i] as i64
-                    }
-                    accum
-                })
-                .reduce(|| vec![0i64; len_wo_prop], |mut a, b| {
-                    for i in 0..len_wo_prop {
-                        a[i] += b[i];
-                    }
-                    a
-                });
+                        different
+                    },
+                )
+                .fold(
+                    || vec![0i64; len_wo_prop],
+                    |mut accum, diff| {
+                        for i in 0..len_wo_prop {
+                            accum[i] += diff[i] as i64
+                        }
+                        accum
+                    },
+                )
+                .reduce(
+                    || vec![0i64; len_wo_prop],
+                    |mut a, b| {
+                        for i in 0..len_wo_prop {
+                            a[i] += b[i];
+                        }
+                        a
+                    },
+                );
 
             let instant = Instant::now();
             // Force wait until we are certain the results have come back
@@ -727,11 +667,8 @@ impl SeatsProjectionMainData {
             .collect();
 
         IterData {
-            vx: &self.vx,
-            vy: &self.vy,
             cx,
             cy,
-            num_voters: self.num_voters,
             num_parties: self.num_parties,
             populace,
         }
@@ -739,12 +676,9 @@ impl SeatsProjectionMainData {
 }
 
 pub struct IterData<'a> {
-    vx: &'a [f64],
-    vy: &'a [f64],
     cx: &'a [f64],
     cy: &'a [f64],
     populace: Vec<Vec<Vec<f64>>>,
-    num_voters: usize,
     num_parties: usize,
 }
 

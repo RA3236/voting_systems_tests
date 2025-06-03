@@ -1,5 +1,3 @@
-use std::sync::{Arc, atomic::AtomicUsize};
-
 use charming::{
     Chart, ImageRenderer,
     component::{Axis, Grid, Legend, Title},
@@ -7,16 +5,16 @@ use charming::{
     series::Bar,
 };
 use internment::ArcIntern;
-use methods::{Method, MethodFn};
+use methods::Method;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 
 use crate::{
     Message, MessageSender,
     runtime_settings::common::{StandardData, WinnerType},
 };
 
-use super::{DistributionManager, ScoreHandle, visualize_distribution::VisualizeDistribution};
+use super::{DistributionManager, visualize_distribution::VisualizeDistribution};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WinnerTypeSettings {
@@ -39,19 +37,21 @@ impl WinnerTypeSettings {
     pub fn simulate(
         &mut self,
         sender: &MessageSender,
-        methods: &FxHashMap<Method, Vec<ScoreHandle>>,
+        methods: &FxHashSet<Method>,
         distr: &DistributionManager,
-        progress: Arc<AtomicUsize>,
-        total: Arc<AtomicUsize>,
     ) {
         let sender = sender.clone();
         let settings = self.inner.clone();
         let distr = distr.clone();
         let methods = methods.clone();
-        total.store(
-            settings.num_iterations * methods.len(),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+
+        let name_arc: ArcIntern<str> = ArcIntern::from("Winner Types");
+        sender
+            .send(Message::TotalProgress(
+                name_arc.clone(),
+                settings.num_iterations * methods.len(),
+            ))
+            .unwrap();
         rayon::spawn(move || {
             // Setup voters and candidates
             let num_iters = settings.num_iterations;
@@ -65,23 +65,10 @@ impl WinnerTypeSettings {
             // Get method names and functions
             let (method_names, funcs) = methods
                 .into_iter()
-                .flat_map(|(method, score_values)| {
-                    score_values.into_iter().map(move |v| {
-                        (
-                            match method.is_score() {
-                                true => format!("{} ({v})", method.name()),
-                                false => method.name().to_string(),
-                            },
-                            match v {
-                                ScoreHandle::Full => method.func() as MethodFn<[f64; 2]>,
-                                ScoreHandle::Custom(v, _) => method.score_fn(v).unwrap(),
-                            },
-                        )
-                    })
-                })
+                .map(|method| (method.name(), method.func()))
                 .collect::<(Vec<_>, Vec<_>)>();
 
-            let average = methods::average(&main).unwrap();
+            let average = methods::average::average(&main).unwrap();
 
             // Perform simulations
             let method_data = funcs
@@ -94,9 +81,12 @@ impl WinnerTypeSettings {
                             let populace = main.create_populace(i);
                             let this_winner = func(&populace).unwrap();
                             let average_winner = average[i];
-                            let condorcet_winner = methods::condorcet(&populace).unwrap();
+                            let condorcet_winner =
+                                methods::condorcet::condorcet(&populace).unwrap();
 
-                            progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            sender
+                                .send(Message::IncrementProgress(name_arc.clone()))
+                                .unwrap();
                             if let Some(condorcet_winner) = condorcet_winner {
                                 if this_winner == condorcet_winner {
                                     if this_winner == average_winner {

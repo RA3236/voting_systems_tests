@@ -1,24 +1,14 @@
-use std::{
-    sync::{Arc, atomic::AtomicUsize},
-    usize,
-};
+use std::usize;
 
-use charming::{
-    Chart, ImageRenderer,
-    component::{Axis, Title, VisualMap, VisualMapChannel},
-    df,
-    element::{AxisType, ItemStyle, Orient},
-    series::{Heatmap, Scatter},
-};
 use internment::ArcIntern;
-use kiddo::{KdTree, SquaredEuclidean};
-use methods::{Method, MethodFn, VectorMethod};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-use rustc_hash::FxHashMap;
+use kiddo::SquaredEuclidean;
+use methods::{Method, VectorMethod};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rustc_hash::FxHashSet;
 
-use crate::{CONTEXT, Message, MessageSender, runtime_settings::common::StandardData};
+use crate::{CONTEXT, Message, MessageSender, runtime_settings::common::StandardData, util::input};
 
-use super::{DistributionManager, ScoreHandle};
+use super::DistributionManager;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualizeDistribution {
@@ -43,35 +33,48 @@ impl VisualizeDistribution {
 
         ui.label("Simulate and visualize the distribution of winners");
         egui::Grid::new(format!("{name} grid")).show(ui, |ui| {
-            for (n, v) in [
-                ("Number of voters", &mut self.num_voters),
-                ("Number of candidates", &mut self.num_candidates),
-                ("Number of iterations", &mut self.num_iterations),
-            ] {
-                ui.label(n);
-                ui.add(egui::DragValue::new(v).range(1..=usize::MAX));
-                ui.end_row();
-            }
+            // for (n, v) in [
+            //     ("Number of voters", &mut self.num_voters),
+            //     ("Number of candidates", &mut self.num_candidates),
+            //     ("Number of iterations", &mut self.num_iterations),
+            // ] {
+            //     ui.label(n);
+            //     ui.add(egui::DragValue::new(v).range(1..=usize::MAX));
+            //     ui.end_row();
+            // }
+            input!(
+                ui,
+                "Number of voters",
+                self.num_voters,
+                usize,
+                "Number of candidates",
+                self.num_candidates,
+                usize,
+                "Number of iterations",
+                self.num_iterations,
+                usize
+            );
         });
     }
 
     pub fn simulate(
         &mut self,
         sender: &MessageSender,
-        methods: &FxHashMap<Method, Vec<ScoreHandle>>,
+        methods: &FxHashSet<Method>,
         distr: &DistributionManager,
-        progress: Arc<AtomicUsize>,
-        total: Arc<AtomicUsize>,
     ) {
         // Clone stuff for rayon sendoff
         let sender = sender.clone();
         let settings = self.clone();
         let distr = distr.clone();
         let methods = methods.clone();
-        total.store(
-            settings.num_iterations * methods.len(),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        let name_arc: ArcIntern<str> = ArcIntern::from("Visualize Distribution");
+        sender
+            .send(Message::TotalProgress(
+                name_arc.clone(),
+                settings.num_iterations * methods.len(),
+            ))
+            .unwrap();
         rayon::spawn(move || {
             // Setup voters and candidates
             let num_iters = settings.num_iterations;
@@ -85,20 +88,7 @@ impl VisualizeDistribution {
             // Get method names and functions
             let methods = methods
                 .into_iter()
-                .flat_map(|(method, score_values)| {
-                    score_values.into_iter().map(move |v| {
-                        (
-                            match method.is_score() {
-                                true => format!("{} ({v})", method.name()),
-                                false => method.name().to_string(),
-                            },
-                            match v {
-                                ScoreHandle::Full => method.func() as MethodFn<[f64; 2]>,
-                                ScoreHandle::Custom(v, _) => method.score_fn(v).unwrap(),
-                            },
-                        )
-                    })
-                })
+                .map(|method| (method.name(), method.func()))
                 .collect::<Vec<_>>();
 
             // Add the voters and candidates
@@ -112,7 +102,9 @@ impl VisualizeDistribution {
                         .into_par_iter()
                         .map(|i| {
                             let populace = main.create_populace(i);
-                            progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            sender
+                                .send(Message::IncrementProgress(name_arc.clone()))
+                                .unwrap();
                             func(&populace).unwrap()
                         })
                         .collect::<Vec<_>>();
@@ -120,8 +112,8 @@ impl VisualizeDistribution {
                 })
                 .chain(
                     [
-                        ("Voters".to_string(), vx.into_iter().zip(vy)),
-                        ("Candidates".to_string(), cx.into_iter().zip(cy)),
+                        ("Voters", vx.into_iter().zip(vy)),
+                        ("Candidates", cx.into_iter().zip(cy)),
                     ]
                     .into_par_iter()
                     .map(|(name, iter)| {

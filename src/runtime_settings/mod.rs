@@ -1,25 +1,24 @@
-use std::{
-    f64,
-    fmt::Display,
-    sync::{Arc, atomic::AtomicUsize},
-    usize,
-};
+use std::{f64, fmt::Display, usize};
 
 use dist_to_average::DistanceSettings;
 use egui::{Color32, PopupCloseBehavior, RichText};
 use methods::Method;
+use nash_multiple::NashMultipleSettings;
+// use nash_single::NashSingleSettings;
 use rand::Rng;
 use rand_distr::{Beta, Distribution as RandDistr, Open01};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use seats_projection::SeatsProjectionSettings;
 use visualize_distribution::VisualizeDistribution;
 use winner_type::WinnerTypeSettings;
 
-use crate::{Message, MessageSender};
+use crate::{Message, MessageSender, util::input};
 
 pub mod common;
 pub mod constants;
 pub mod dist_to_average;
+pub mod nash_multiple;
+// pub mod nash_single;
 pub mod seats_projection;
 pub mod visualize_distribution;
 pub mod winner_type;
@@ -29,6 +28,10 @@ pub const SAVE_VISUALIZE: &str = "distribution";
 pub const SAVE_WINNER_TYPE: &str = "winner type";
 pub const SAVE_DISTANCES: &str = "distances";
 pub const SAVE_SEATS_PROJECTION: &str = "seat projections";
+pub const SAVE_NASH_SINGLE: &str = "nash single";
+pub const SAVE_NASH_SINGLE_INDIVIDUAL: &str = "nash single/individual";
+pub const SAVE_NASH_MULTIPLE: &str = "nash multiple";
+pub const SAVE_NASH_MULTIPLE_INDIVIDIAL: &str = "nash multiple/individual";
 
 pub fn get_file_and_uri(loc: &str, filename: &str) -> (String, String) {
     let save_path = format!("{SAVE_LOCATION}/{loc}/{filename}");
@@ -42,16 +45,15 @@ pub struct AppRuntimeSettings {
     num_locks: usize,
     current: usize,
     actions: FxHashSet<Action>,
-    methods: FxHashMap<Method, Vec<ScoreHandle>>,
+    methods: FxHashSet<Method>,
     distrs: DistributionManager,
 
     visualize: VisualizeDistribution,
     winner_types: WinnerTypeSettings,
     distances: DistanceSettings,
     seat_projections: SeatsProjectionSettings,
-
-    progress: Vec<(&'static str, Arc<AtomicUsize>)>,
-    totals: Vec<Arc<AtomicUsize>>,
+    // nash_single: NashSingleSettings,
+    nash_multiple: NashMultipleSettings,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +78,10 @@ impl Default for AppRuntimeSettings {
             SAVE_WINNER_TYPE,
             SAVE_DISTANCES,
             SAVE_SEATS_PROJECTION,
+            SAVE_NASH_SINGLE,
+            SAVE_NASH_SINGLE_INDIVIDUAL,
+            SAVE_NASH_MULTIPLE,
+            SAVE_NASH_MULTIPLE_INDIVIDIAL,
         ] {
             let dir_name = format!("{SAVE_LOCATION}/{location}");
             std::fs::create_dir_all(dir_name).unwrap();
@@ -86,33 +92,19 @@ impl Default for AppRuntimeSettings {
             current: 0,
             num_locks: 0,
             actions: FxHashSet::default(),
-            methods: FxHashMap::default(),
+            methods: FxHashSet::default(),
             distrs: DistributionManager::default(),
             visualize: VisualizeDistribution::default(),
             winner_types: WinnerTypeSettings::default(),
             distances: DistanceSettings::default(),
             seat_projections: SeatsProjectionSettings::default(),
-            progress: vec![],
-            totals: vec![],
+            // nash_single: NashSingleSettings::default(),
+            nash_multiple: NashMultipleSettings::default(),
         }
     }
 }
 
 impl AppRuntimeSettings {
-    pub fn progress(&self) -> impl Iterator<Item = (&'static str, f64)> {
-        self.progress
-            .iter()
-            .zip(self.totals.iter())
-            .map(|((name, progress), total)| {
-                (
-                    *name,
-                    progress.load(std::sync::atomic::Ordering::SeqCst),
-                    total.load(std::sync::atomic::Ordering::SeqCst),
-                )
-            })
-            .map(|(name, progress, total)| (name, progress as f64 / total as f64))
-    }
-
     pub fn unlock(&mut self) {
         self.current += 1;
         if self.num_locks == self.current {
@@ -125,7 +117,7 @@ impl AppRuntimeSettings {
     }
 
     fn total_selected_methods(&self) -> usize {
-        self.methods.iter().map(|(_, v)| v.len()).sum()
+        self.methods.len()
     }
 
     pub fn show(&mut self, sender: &MessageSender, ui: &mut egui::Ui) {
@@ -138,8 +130,6 @@ impl AppRuntimeSettings {
                     self.num_locks = self.actions.len();
                     self.current = 0;
                     sender.send(Message::DropImages).unwrap();
-                    self.progress.clear();
-                    self.totals.clear();
 
                     std::fs::remove_dir_all("output").unwrap();
                     for location in [
@@ -147,44 +137,39 @@ impl AppRuntimeSettings {
                         SAVE_WINNER_TYPE,
                         SAVE_DISTANCES,
                         SAVE_SEATS_PROJECTION,
+                        SAVE_NASH_SINGLE,
+                        SAVE_NASH_SINGLE_INDIVIDUAL,
+                        SAVE_NASH_MULTIPLE,
+                        SAVE_NASH_MULTIPLE_INDIVIDIAL,
                     ] {
                         let dir_name = format!("{SAVE_LOCATION}/{location}");
                         std::fs::create_dir_all(dir_name).unwrap();
                     }
 
-                    for (i, action) in self.actions.iter().enumerate() {
-                        self.progress
-                            .push((action.to_str(), Arc::new(AtomicUsize::new(0))));
-                        self.totals.push(Arc::new(AtomicUsize::new(0)));
+                    for action in &self.actions {
                         match action {
-                            Action::VisualizeDistribution => self.visualize.simulate(
-                                sender,
-                                &self.methods,
-                                &self.distrs,
-                                self.progress[i].1.clone(),
-                                self.totals[i].clone(),
-                            ),
-                            Action::WinnerType => self.winner_types.simulate(
-                                sender,
-                                &self.methods,
-                                &self.distrs,
-                                self.progress[i].1.clone(),
-                                self.totals[i].clone(),
-                            ),
-                            Action::Distance => self.distances.simulate(
-                                sender,
-                                &self.methods,
-                                &self.distrs,
-                                self.progress[i].1.clone(),
-                                self.totals[i].clone(),
-                            ),
-                            Action::SimulateElection => self.seat_projections.simulate(
-                                sender,
-                                &self.methods,
-                                &self.distrs,
-                                self.progress[i].1.clone(),
-                                self.totals[i].clone(),
-                            ),
+                            Action::VisualizeDistribution => {
+                                self.visualize.simulate(sender, &self.methods, &self.distrs)
+                            }
+                            Action::WinnerType => {
+                                self.winner_types
+                                    .simulate(sender, &self.methods, &self.distrs)
+                            }
+                            Action::Distance => {
+                                self.distances.simulate(sender, &self.methods, &self.distrs)
+                            }
+                            Action::SimulateElection => {
+                                self.seat_projections
+                                    .simulate(sender, &self.methods, &self.distrs)
+                            }
+                            // Action::NashSingle => {
+                            //     self.nash_single
+                            //         .simulate(sender, &self.methods, &self.distrs)
+                            // }
+                            Action::NashMultiple => {
+                                self.nash_multiple
+                                    .simulate(sender, &self.methods, &self.distrs)
+                            }
                         }
                     }
                 }
@@ -227,20 +212,18 @@ impl AppRuntimeSettings {
                                 .show(ui, |ui| {
                                     if ui.button("Select All").clicked() {
                                         for method in Method::iter() {
-                                            self.methods.insert(method, vec![ScoreHandle::Full]);
+                                            self.methods.insert(method);
                                         }
                                     }
                                     ui.end_row();
                                     for method in Method::iter() {
-                                        let mut value = self.methods.contains_key(&method);
+                                        let mut value = self.methods.contains(&method);
                                         ui.checkbox(&mut value, method.name());
                                         ui.label(method.desc());
                                         ui.end_row();
 
                                         match value {
-                                            true => {
-                                                self.methods.insert(method, vec![ScoreHandle::Full])
-                                            }
+                                            true => self.methods.insert(method),
                                             false => self.methods.remove(&method),
                                         };
                                     }
@@ -271,79 +254,8 @@ impl AppRuntimeSettings {
                         Action::WinnerType => self.winner_types.show(ui),
                         Action::Distance => self.distances.show(ui),
                         Action::SimulateElection => self.seat_projections.show(&self.methods, ui),
-                        _ => {}
-                    });
-                }
-
-                // Allow the user to modify each score method
-                for (method, score_handles) in self.methods.iter_mut() {
-                    if !method.is_score() {
-                        continue;
-                    }
-
-                    ui.group(|ui| {
-                        ui.heading(format!("{} Settings", method.name()));
-                        ui.label("Configure the distances for score voting");
-                        ui.label("Each row represents a separate simulation");
-                        let mut change = false;
-                        let mut remove_index = 0;
-
-                        let has_full = match &score_handles[0] {
-                            ScoreHandle::Full => true,
-                            ScoreHandle::Custom(..) => false,
-                        };
-
-                        egui::Grid::new(format!("{} score grid", method.name()))
-                            .num_columns(3)
-                            .show(ui, |ui| {
-                                let len = score_handles.len();
-                                for (i, score_handle) in score_handles.iter_mut().enumerate() {
-                                    match score_handle {
-                                        ScoreHandle::Full => {
-                                            ui.label("Full");
-                                            if ui.button("Switch to custom").clicked() {
-                                                *score_handle =
-                                                    ScoreHandle::Custom(1.0, 1.0f64.to_string());
-                                            }
-                                        }
-                                        ScoreHandle::Custom(value, value_string) => {
-                                            crate::util::typed_textbox(
-                                                value,
-                                                value_string,
-                                                ui,
-                                                0.0,
-                                                2.0,
-                                            );
-                                            ui.add_enabled_ui(!has_full, |ui| {
-                                                if ui.button("Switch to full").clicked() {
-                                                    *score_handle = ScoreHandle::Full;
-                                                }
-                                            });
-                                        }
-                                    }
-                                    ui.add_enabled_ui(len > 1, |ui| {
-                                        if ui.button("Remove").clicked() {
-                                            change = true;
-                                            remove_index = i;
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-
-                        if change {
-                            score_handles.remove(remove_index);
-                        }
-
-                        ui.vertical_centered_justified(|ui| {
-                            if !has_full && ui.button("Add Full").clicked() {
-                                score_handles.insert(0, ScoreHandle::Full);
-                            }
-
-                            if ui.button("Add Custom").clicked() {
-                                score_handles.push(ScoreHandle::Custom(1.0f64, 1.0f64.to_string()));
-                            }
-                        });
+                        // Action::NashSingle => self.nash_single.show(ui),
+                        Action::NashMultiple => self.nash_multiple.show(ui),
                     });
                 }
             });
@@ -442,32 +354,31 @@ impl DistributionManager {
                     ui.end_row();
 
                     if *complex {
-                        for (name, value) in [
-                            ("X alpha", xa),
-                            ("X beta", xb),
-                            ("Y alpha", ya),
-                            ("Y beta", yb),
-                        ] {
-                            ui.label(name);
-                            ui.add(egui::DragValue::new(value).range(1.0..=f64::MAX));
-                            ui.end_row();
-                        }
+                        input!(ui,
+                            "X alpha", *xa, f64, min 1.0,
+                            "X beta", *xb, f64, min 1.0,
+                            "Y alpha", *ya, f64, min 1.0,
+                            "Y beta", *yb, f64, min 1.0
+                        );
                     } else {
-                        for (name, a, b) in [("X params", xa, xb), ("Y params", ya, yb)] {
-                            ui.label(name);
-                            ui.add(egui::DragValue::new(a).range(1.0..=f64::MAX));
-                            ui.end_row();
-
-                            *b = *a;
-                        }
+                        input!(ui,
+                            "X params", *xa, f64, min 1.0,
+                            "Y params", *ya, f64, min 1.0
+                        );
+                        *xb = *xa;
+                        *yb = *ya;
                     }
                 }
                 Distribution::Uniform(x, y) => {
-                    for (name, value) in [("X scale", x), ("Y scale", y)] {
-                        ui.label(name);
-                        ui.add(egui::DragValue::new(value).range(1.0..=f64::MAX));
-                        ui.end_row();
-                    }
+                    // for (name, value) in [("X scale", x), ("Y scale", y)] {
+                    //     ui.label(name);
+                    //     ui.add(egui::DragValue::new(value).range(1.0..=f64::MAX));
+                    //     ui.end_row();
+                    // }
+                    input!(ui,
+                        "X scale", *x, f64, min 1.0,
+                        "Y scale", *y, f64, min 1.0
+                    );
                 }
             }
 
@@ -594,5 +505,7 @@ define_action! {
     VisualizeDistribution, "Visualize distribution",
     WinnerType, "Types of winners",
     Distance, "Distances to Condorcet/average voter",
-    SimulateElection, "Simulate a country-wide election"
+    SimulateElection, "Simulate a country-wide election",
+    // NashSingle, "Simulate isolated elections to find Nash equilibrium",
+    NashMultiple, "Simulate country-wide elections to find Nash equilibrium"
 }

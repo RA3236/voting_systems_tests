@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::{MethodsError, PopulaceMethod};
+use crate::{CachedMethod, MethodsError, PopulaceMethod};
 
 /// Ranked Pairs
 pub fn ranked_pairs<T>(populace: &dyn PopulaceMethod<T>) -> crate::Result<T> {
@@ -70,4 +70,35 @@ pub fn ranked_pairs<T>(populace: &dyn PopulaceMethod<T>) -> crate::Result<T> {
         .find(|&x| (0..num_candidates).into_iter().all(|y| !graph[y][x]))
         .map(|i| populace.candidate_at(i))
         .ok_or_else(|| MethodsError::Generic(format!("unreachable")))?
+}
+
+pub struct RankedPairsCached {}
+
+impl CachedMethod for RankedPairsCached {
+    fn new(
+        initial_populace: Vec<Vec<f64>>,
+        num_voters: usize,
+        num_candidates: usize,
+    ) -> crate::Result<Box<dyn CachedMethod + Send>>
+    where
+        Self: Sized,
+    {
+        todo!()
+    }
+
+    fn get_current_result(&mut self) -> crate::Result<usize> {
+        todo!()
+    }
+
+    fn mock_score_candidate(
+        &mut self,
+        candidate: usize,
+        distances: &[f64],
+    ) -> crate::Result<isize> {
+        todo!()
+    }
+
+    fn update_candidate(&mut self, candidate: usize, new_distances: &[f64]) -> crate::Result<()> {
+        todo!()
+    }
 }
